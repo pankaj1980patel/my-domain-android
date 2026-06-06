@@ -28,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -119,6 +120,7 @@ fn bind_multicast(iface: Ipv4Addr) -> std::io::Result<UdpSocket> {
     socket.join_multicast_v4(&MCAST_GROUP, &iface)?;
     socket.set_multicast_if_v4(&iface)?; // send beacons out this interface (Wi-Fi)
     socket.set_multicast_loop_v4(true)?;
+    info!("joined {MCAST_GROUP}:{DISCOVERY_PORT} on iface {iface}");
     Ok(socket.into())
 }
 
@@ -135,14 +137,30 @@ fn discovery_recv_loop(socket: UdpSocket, peers: Arc<Mutex<HashMap<String, Peer>
     loop {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("disco recv error: {e}");
+                continue;
+            }
         };
         let beacon: Beacon = match serde_json::from_slice(&buf[..len]) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("rx {len}B from {src}: not a beacon ({e})");
+                continue;
+            }
         };
         if beacon.node_id == my_id {
             continue;
+        }
+        let is_new = !peers.lock().unwrap().contains_key(&beacon.node_id);
+        if is_new {
+            info!(
+                "NEW peer '{}' @ {} (tcp {}, udp {})",
+                beacon.name,
+                src.ip(),
+                beacon.tcp_port,
+                beacon.udp_port
+            );
         }
         let peer = Peer {
             node_id: beacon.node_id.clone(),
@@ -165,8 +183,12 @@ fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
     };
     let payload = serde_json::to_vec(&beacon).unwrap();
     let dst = SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT);
+    info!("beaconing as '{}' -> {}:{}", beacon.name, MCAST_GROUP, DISCOVERY_PORT);
     loop {
-        let _ = socket.send_to(&payload, dst);
+        match socket.send_to(&payload, dst) {
+            Ok(n) => info!("beacon sent ({n}B) -> {}:{}", MCAST_GROUP, DISCOVERY_PORT),
+            Err(e) => warn!("beacon send error: {e}"),
+        }
         std::thread::sleep(BEACON_INTERVAL);
     }
 }
@@ -193,6 +215,7 @@ fn tcp_recv_loop(listener: TcpListener, inbox: Arc<Mutex<VecDeque<IncomingMessag
                 return;
             }
             if let Ok(msg) = serde_json::from_slice::<WireMessage>(&buf) {
+                info!("TCP msg from {} ({}): {}", msg.from, ip, msg.text);
                 push_inbox(
                     &inbox,
                     IncomingMessage {
@@ -216,6 +239,7 @@ fn udp_recv_loop(socket: UdpSocket, inbox: Arc<Mutex<VecDeque<IncomingMessage>>>
             Err(_) => continue,
         };
         if let Ok(msg) = serde_json::from_slice::<WireMessage>(&buf[..len]) {
+            info!("UDP msg from {} ({}): {}", msg.from, src.ip(), msg.text);
             push_inbox(
                 &inbox,
                 IncomingMessage {
@@ -261,6 +285,10 @@ fn build_state(name: String, wifi_ip: String) -> NetState {
         tcp_port,
         udp_port,
     };
+    info!(
+        "identity name='{}' ip={} tcp={} udp={} iface={} id={}",
+        identity.name, identity.ip, identity.tcp_port, identity.udp_port, iface, identity.node_id
+    );
 
     let peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
     let inbox: Arc<Mutex<VecDeque<IncomingMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -369,8 +397,15 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'local>(
     name: JString<'local>,
     wifi_ip: JString<'local>,
 ) -> jstring {
+    // Logs show up in `adb logcat -s mydomain_net` (or Logcat tag "mydomain_net").
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("mydomain_net"),
+    );
     let name = jstr_to_string(&mut env, &name, "android");
     let wifi_ip = jstr_to_string(&mut env, &wifi_ip, "");
+    info!("nativeStart name='{name}' wifi_ip='{wifi_ip}'");
     let state = ensure_started(name, wifi_ip);
     let json = serde_json::to_string(&state.identity).unwrap_or_else(|_| "{}".into());
     ret_string(&mut env, json)
