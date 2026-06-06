@@ -1,0 +1,404 @@
+// LAN discovery + UDP/TCP messaging for Android, exposed to Kotlin over JNI.
+//
+// This speaks the exact same wire protocol as the desktop (Tauri) app, so the
+// two interoperate on the same LAN:
+//
+//   * Discovery beacon  -> UDP multicast 239.255.42.98:45678, every 2s:
+//       {"node_id","name","tcp_port","udp_port"}
+//   * Message           -> JSON body of a TCP connection, OR a single UDP
+//       datagram sent to the peer's advertised port:
+//       {"from","text"}
+//
+// The Rust side runs the network loops on background threads and keeps state
+// (peer table + an inbox queue) behind mutexes. Kotlin drives it by polling:
+//   nativeStart(name) -> identity json   (idempotent)
+//   nativeGetPeers()  -> [peer, ...]
+//   nativePollMessages() -> [msg, ...]   (drains the inbox)
+//   nativeSend(node_id, protocol, text) -> "" on success, "ERROR: .." otherwise
+//
+// NOTE: receiving multicast on Android requires a WifiManager.MulticastLock,
+// which is acquired on the Kotlin side before nativeStart() is called.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use jni::objects::{JClass, JString};
+use jni::sys::jstring;
+use jni::JNIEnv;
+use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
+
+const MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 98);
+const DISCOVERY_PORT: u16 = 45678;
+const BEACON_INTERVAL: Duration = Duration::from_secs(2);
+const PEER_TIMEOUT_SECS: u64 = 8;
+const INBOX_CAP: usize = 500;
+
+#[derive(Clone, Serialize)]
+struct Identity {
+    node_id: String,
+    name: String,
+    ip: String,
+    tcp_port: u16,
+    udp_port: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Beacon {
+    node_id: String,
+    name: String,
+    tcp_port: u16,
+    udp_port: u16,
+}
+
+#[derive(Clone, Serialize)]
+struct Peer {
+    node_id: String,
+    name: String,
+    ip: String,
+    tcp_port: u16,
+    udp_port: u16,
+    last_seen: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireMessage {
+    from: String,
+    text: String,
+}
+
+#[derive(Clone, Serialize)]
+struct IncomingMessage {
+    from: String,
+    ip: String,
+    protocol: String,
+    text: String,
+    ts: u64,
+}
+
+struct NetState {
+    identity: Identity,
+    peers: Arc<Mutex<HashMap<String, Peer>>>,
+    inbox: Arc<Mutex<VecDeque<IncomingMessage>>>,
+}
+
+static STATE: OnceLock<NetState> = OnceLock::new();
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Best-effort local LAN IP (no traffic is actually sent).
+fn local_ip() -> String {
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            Ok(s.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "0.0.0.0".to_string())
+}
+
+/// UDP socket bound to the multicast port and joined to the group, with
+/// address/port reuse so it coexists with other listeners.
+fn bind_multicast() -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DISCOVERY_PORT);
+    socket.bind(&addr.into())?;
+    socket.join_multicast_v4(&MCAST_GROUP, &Ipv4Addr::UNSPECIFIED)?;
+    socket.set_multicast_loop_v4(true)?;
+    Ok(socket.into())
+}
+
+fn push_inbox(inbox: &Arc<Mutex<VecDeque<IncomingMessage>>>, msg: IncomingMessage) {
+    let mut q = inbox.lock().unwrap();
+    if q.len() >= INBOX_CAP {
+        q.pop_front();
+    }
+    q.push_back(msg);
+}
+
+fn discovery_recv_loop(socket: UdpSocket, peers: Arc<Mutex<HashMap<String, Peer>>>, my_id: String) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let beacon: Beacon = match serde_json::from_slice(&buf[..len]) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if beacon.node_id == my_id {
+            continue;
+        }
+        let peer = Peer {
+            node_id: beacon.node_id.clone(),
+            name: beacon.name,
+            ip: src.ip().to_string(),
+            tcp_port: beacon.tcp_port,
+            udp_port: beacon.udp_port,
+            last_seen: now_secs(),
+        };
+        peers.lock().unwrap().insert(beacon.node_id, peer);
+    }
+}
+
+fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
+    let beacon = Beacon {
+        node_id: identity.node_id,
+        name: identity.name,
+        tcp_port: identity.tcp_port,
+        udp_port: identity.udp_port,
+    };
+    let payload = serde_json::to_vec(&beacon).unwrap();
+    let dst = SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT);
+    loop {
+        let _ = socket.send_to(&payload, dst);
+        std::thread::sleep(BEACON_INTERVAL);
+    }
+}
+
+fn prune_loop(peers: Arc<Mutex<HashMap<String, Peer>>>) {
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let cutoff = now_secs().saturating_sub(PEER_TIMEOUT_SECS);
+        peers.lock().unwrap().retain(|_, p| p.last_seen >= cutoff);
+    }
+}
+
+fn tcp_recv_loop(listener: TcpListener, inbox: Arc<Mutex<VecDeque<IncomingMessage>>>) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let inbox = inbox.clone();
+        std::thread::spawn(move || {
+            let ip = stream
+                .peer_addr()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_default();
+            let mut buf = Vec::new();
+            if stream.read_to_end(&mut buf).is_err() {
+                return;
+            }
+            if let Ok(msg) = serde_json::from_slice::<WireMessage>(&buf) {
+                push_inbox(
+                    &inbox,
+                    IncomingMessage {
+                        from: msg.from,
+                        ip,
+                        protocol: "TCP".into(),
+                        text: msg.text,
+                        ts: now_secs(),
+                    },
+                );
+            }
+        });
+    }
+}
+
+fn udp_recv_loop(socket: UdpSocket, inbox: Arc<Mutex<VecDeque<IncomingMessage>>>) {
+    let mut buf = [0u8; 65535];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Ok(msg) = serde_json::from_slice::<WireMessage>(&buf[..len]) {
+            push_inbox(
+                &inbox,
+                IncomingMessage {
+                    from: msg.from,
+                    ip: src.ip().to_string(),
+                    protocol: "UDP".into(),
+                    text: msg.text,
+                    ts: now_secs(),
+                },
+            );
+        }
+    }
+}
+
+/// Build the networking state and start all loops. Runs exactly once.
+fn build_state(name: String) -> NetState {
+    let node_id = uuid::Uuid::new_v4().to_string();
+
+    // Ephemeral TCP + UDP ports, advertised in the beacon.
+    let tcp_listener = TcpListener::bind("0.0.0.0:0").expect("bind tcp");
+    let tcp_port = tcp_listener.local_addr().expect("tcp addr").port();
+    let udp_msg_socket = UdpSocket::bind("0.0.0.0:0").expect("bind udp");
+    let udp_port = udp_msg_socket.local_addr().expect("udp addr").port();
+
+    let identity = Identity {
+        node_id: node_id.clone(),
+        name,
+        ip: local_ip(),
+        tcp_port,
+        udp_port,
+    };
+
+    let peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
+    let inbox: Arc<Mutex<VecDeque<IncomingMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Discovery: one socket shared (clone) for send + receive.
+    if let Ok(disco_recv) = bind_multicast() {
+        if let Ok(disco_send) = disco_recv.try_clone() {
+            {
+                let peers = peers.clone();
+                let my_id = node_id.clone();
+                std::thread::spawn(move || discovery_recv_loop(disco_recv, peers, my_id));
+            }
+            {
+                let identity = identity.clone();
+                std::thread::spawn(move || beacon_send_loop(disco_send, identity));
+            }
+        }
+    }
+    {
+        let peers = peers.clone();
+        std::thread::spawn(move || prune_loop(peers));
+    }
+    {
+        let inbox = inbox.clone();
+        std::thread::spawn(move || tcp_recv_loop(tcp_listener, inbox));
+    }
+    {
+        let inbox = inbox.clone();
+        std::thread::spawn(move || udp_recv_loop(udp_msg_socket, inbox));
+    }
+
+    NetState {
+        identity,
+        peers,
+        inbox,
+    }
+}
+
+fn ensure_started(name: String) -> &'static NetState {
+    STATE.get_or_init(|| build_state(name))
+}
+
+fn do_send(node_id: &str, protocol: &str, text: &str) -> Result<(), String> {
+    let state = STATE.get().ok_or("network not started")?;
+    let peer = state
+        .peers
+        .lock()
+        .unwrap()
+        .get(node_id)
+        .cloned()
+        .ok_or("peer not found (it may have gone offline)")?;
+
+    let payload = serde_json::to_vec(&WireMessage {
+        from: state.identity.name.clone(),
+        text: text.to_string(),
+    })
+    .map_err(|e| e.to_string())?;
+
+    match protocol.to_uppercase().as_str() {
+        "TCP" => {
+            let ip: Ipv4Addr = peer.ip.parse().map_err(|_| "bad peer ip")?;
+            let addr = SocketAddr::new(ip.into(), peer.tcp_port);
+            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("TCP connect failed: {e}"))?;
+            stream
+                .write_all(&payload)
+                .map_err(|e| format!("TCP send failed: {e}"))?;
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "UDP" => {
+            let ip: Ipv4Addr = peer.ip.parse().map_err(|_| "bad peer ip")?;
+            let addr = SocketAddr::new(ip.into(), peer.udp_port);
+            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+            socket
+                .send_to(&payload, addr)
+                .map_err(|e| format!("UDP send failed: {e}"))?;
+            Ok(())
+        }
+        other => Err(format!("unknown protocol: {other}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JNI surface — package com.mydomain.android, class RustNet
+// ---------------------------------------------------------------------------
+
+fn jstr_to_string(env: &mut JNIEnv, s: &JString, fallback: &str) -> String {
+    env.get_string(s)
+        .map(|v| v.into())
+        .unwrap_or_else(|_| fallback.to_string())
+}
+
+fn ret_string(env: &mut JNIEnv, s: String) -> jstring {
+    env.new_string(s)
+        .map(|o| o.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+) -> jstring {
+    let name = jstr_to_string(&mut env, &name, "android");
+    let state = ensure_started(name);
+    let json = serde_json::to_string(&state.identity).unwrap_or_else(|_| "{}".into());
+    ret_string(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeGetPeers<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let json = match STATE.get() {
+        Some(s) => {
+            let list: Vec<Peer> = s.peers.lock().unwrap().values().cloned().collect();
+            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        }
+        None => "[]".into(),
+    };
+    ret_string(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativePollMessages<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let json = match STATE.get() {
+        Some(s) => {
+            let drained: Vec<IncomingMessage> = s.inbox.lock().unwrap().drain(..).collect();
+            serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into())
+        }
+        None => "[]".into(),
+    };
+    ret_string(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSend<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    node_id: JString<'local>,
+    protocol: JString<'local>,
+    text: JString<'local>,
+) -> jstring {
+    let node_id = jstr_to_string(&mut env, &node_id, "");
+    let protocol = jstr_to_string(&mut env, &protocol, "UDP");
+    let text = jstr_to_string(&mut env, &text, "");
+    let result = match do_send(&node_id, &protocol, &text) {
+        Ok(()) => String::new(),
+        Err(e) => format!("ERROR: {e}"),
+    };
+    ret_string(&mut env, result)
+}

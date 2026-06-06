@@ -1,0 +1,15 @@
+# Android / Gradle
+.gradle/
+build/
+captures/
+local.properties
+*.iml
+.idea/
+.cxx/
+.kotlin/
+
+# Rust
+rust/target/
+
+# OS
+.DS_Store

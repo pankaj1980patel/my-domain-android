@@ -1,0 +1,22 @@
+[package]
+name = "mydomain_net"
+version = "0.1.0"
+edition = "2021"
+description = "LAN discovery + UDP/TCP messaging core, shared with the desktop app, exposed to Android over JNI."
+
+[lib]
+name = "mydomain_net"
+# cdylib -> produces lib<name>.so for Android; the JNI symbols are the public ABI.
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.5", features = ["all"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
