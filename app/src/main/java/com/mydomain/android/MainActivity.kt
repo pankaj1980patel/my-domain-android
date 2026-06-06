@@ -80,8 +80,9 @@ class MainActivity : ComponentActivity() {
             acquire()
         }
 
-        // Start the Rust networking core with this device's name.
-        val identityJson = RustNet.nativeStart(Build.MODEL ?: "android")
+        // Start the Rust networking core with this device's name + Wi-Fi IP so
+        // multicast discovery uses the Wi-Fi interface (not cellular).
+        val identityJson = RustNet.nativeStart(Build.MODEL ?: "android", wifiIpv4())
         val identity = JSONObject(identityJson)
 
         setContent {
@@ -100,6 +101,30 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         multicastLock?.let { if (it.isHeld) it.release() }
     }
+}
+
+/**
+ * Best-effort Wi-Fi IPv4 address. Prefers the wlan interface, then any
+ * site-local IPv4. Returns "" if none (e.g. Wi-Fi off) so Rust can fall back.
+ */
+private fun wifiIpv4(): String {
+    fun scan(preferWlan: Boolean): String? {
+        val ifaces = runCatching { java.net.NetworkInterface.getNetworkInterfaces() }
+            .getOrNull() ?: return null
+        for (iface in ifaces) {
+            if (!iface.isUp || iface.isLoopback) continue
+            val name = iface.name.lowercase()
+            if (preferWlan && !(name.startsWith("wlan") || name.startsWith("ap"))) continue
+            for (addr in iface.inetAddresses) {
+                if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
+                    val host = addr.hostAddress
+                    if (host != null && (preferWlan || addr.isSiteLocalAddress)) return host
+                }
+            }
+        }
+        return null
+    }
+    return scan(preferWlan = true) ?: scan(preferWlan = false) ?: ""
 }
 
 private fun parsePeers(json: String): List<Peer> {

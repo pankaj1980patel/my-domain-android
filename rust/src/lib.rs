@@ -106,13 +106,18 @@ fn local_ip() -> String {
 
 /// UDP socket bound to the multicast port and joined to the group, with
 /// address/port reuse so it coexists with other listeners.
-fn bind_multicast() -> std::io::Result<UdpSocket> {
+///
+/// `iface` is the local IPv4 of the interface to use. On Android this MUST be
+/// the Wi-Fi address: it both joins the group on Wi-Fi (RX) and pins outgoing
+/// multicast to Wi-Fi (TX) so beacons don't leak out over cellular and vanish.
+fn bind_multicast(iface: Ipv4Addr) -> std::io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
     let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DISCOVERY_PORT);
     socket.bind(&addr.into())?;
-    socket.join_multicast_v4(&MCAST_GROUP, &Ipv4Addr::UNSPECIFIED)?;
+    socket.join_multicast_v4(&MCAST_GROUP, &iface)?;
+    socket.set_multicast_if_v4(&iface)?; // send beacons out this interface (Wi-Fi)
     socket.set_multicast_loop_v4(true)?;
     Ok(socket.into())
 }
@@ -226,8 +231,22 @@ fn udp_recv_loop(socket: UdpSocket, inbox: Arc<Mutex<VecDeque<IncomingMessage>>>
 }
 
 /// Build the networking state and start all loops. Runs exactly once.
-fn build_state(name: String) -> NetState {
+///
+/// `wifi_ip` is the device's Wi-Fi IPv4 (from Kotlin). If empty/invalid we fall
+/// back to the default-route IP, but on a phone that may be cellular — so the
+/// caller should always pass the real Wi-Fi address.
+fn build_state(name: String, wifi_ip: String) -> NetState {
     let node_id = uuid::Uuid::new_v4().to_string();
+
+    // The interface to discover/advertise on. Prefer the supplied Wi-Fi IP.
+    let iface: Ipv4Addr = wifi_ip
+        .parse()
+        .unwrap_or_else(|_| local_ip().parse().unwrap_or(Ipv4Addr::UNSPECIFIED));
+    let ip_display = if iface.is_unspecified() {
+        local_ip()
+    } else {
+        iface.to_string()
+    };
 
     // Ephemeral TCP + UDP ports, advertised in the beacon.
     let tcp_listener = TcpListener::bind("0.0.0.0:0").expect("bind tcp");
@@ -238,7 +257,7 @@ fn build_state(name: String) -> NetState {
     let identity = Identity {
         node_id: node_id.clone(),
         name,
-        ip: local_ip(),
+        ip: ip_display,
         tcp_port,
         udp_port,
     };
@@ -247,7 +266,7 @@ fn build_state(name: String) -> NetState {
     let inbox: Arc<Mutex<VecDeque<IncomingMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // Discovery: one socket shared (clone) for send + receive.
-    if let Ok(disco_recv) = bind_multicast() {
+    if let Ok(disco_recv) = bind_multicast(iface) {
         if let Ok(disco_send) = disco_recv.try_clone() {
             {
                 let peers = peers.clone();
@@ -280,8 +299,8 @@ fn build_state(name: String) -> NetState {
     }
 }
 
-fn ensure_started(name: String) -> &'static NetState {
-    STATE.get_or_init(|| build_state(name))
+fn ensure_started(name: String, wifi_ip: String) -> &'static NetState {
+    STATE.get_or_init(move || build_state(name, wifi_ip))
 }
 
 fn do_send(node_id: &str, protocol: &str, text: &str) -> Result<(), String> {
@@ -348,9 +367,11 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     name: JString<'local>,
+    wifi_ip: JString<'local>,
 ) -> jstring {
     let name = jstr_to_string(&mut env, &name, "android");
-    let state = ensure_started(name);
+    let wifi_ip = jstr_to_string(&mut env, &wifi_ip, "");
+    let state = ensure_started(name, wifi_ip);
     let json = serde_json::to_string(&state.identity).unwrap_or_else(|_| "{}".into());
     ret_string(&mut env, json)
 }

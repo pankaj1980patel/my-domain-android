@@ -15,8 +15,12 @@ object RustNet {
         System.loadLibrary("mydomain_net")
     }
 
-    /** Idempotent: starts discovery + listeners once, returns identity JSON. */
-    external fun nativeStart(name: String): String
+    /**
+     * Idempotent: starts discovery + listeners once, returns identity JSON.
+     * [wifiIp] must be the device's Wi-Fi IPv4 so multicast is sent/joined on
+     * Wi-Fi (not cellular) and the advertised address is reachable by peers.
+     */
+    external fun nativeStart(name: String, wifiIp: String): String
 
     external fun nativeGetPeers(): String
 
