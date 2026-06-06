@@ -234,7 +234,7 @@ fun AppScreen(myName: String, myIp: String, myTcp: Int, myUdp: Int) {
                         .fillMaxWidth()
                         .menuAnchor(),
                 )
-                androidx.compose.material3.ExposedDropdownMenu(
+                ExposedDropdownMenu(
                     expanded = menuExpanded,
                     onDismissRequest = { menuExpanded = false },
                 ) {
