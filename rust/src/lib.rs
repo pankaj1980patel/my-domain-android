@@ -196,8 +196,17 @@ fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
         let o = v4.octets();
         let directed = Ipv4Addr::new(o[0], o[1], o[2], 255);
         targets.push(SocketAddr::new(directed.into(), DISCOVERY_PORT));
+        // Unicast sweep of the /24. Last-resort discovery for networks that
+        // drop both multicast and broadcast but allow client-to-client unicast.
+        for host in 1..=254u8 {
+            if host == o[3] {
+                continue; // skip ourselves
+            }
+            let ip = Ipv4Addr::new(o[0], o[1], o[2], host);
+            targets.push(SocketAddr::new(ip.into(), DISCOVERY_PORT));
+        }
     }
-    info!("beaconing as '{}' -> {:?}", beacon.name, targets);
+    info!("beaconing as '{}' -> {} targets", beacon.name, targets.len());
     loop {
         for dst in &targets {
             if let Err(e) = socket.send_to(&payload, dst) {
