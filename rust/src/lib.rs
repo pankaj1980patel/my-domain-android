@@ -36,6 +36,7 @@ const MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 98);
 const DISCOVERY_PORT: u16 = 45678;
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const PEER_TIMEOUT_SECS: u64 = 8;
+const SWEEP_EVERY_TICKS: u64 = 5; // run the unicast fallback every 5th beacon (~10s)
 const INBOX_CAP: usize = 500;
 
 #[derive(Clone, Serialize)]
@@ -185,38 +186,49 @@ fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
     let payload = serde_json::to_vec(&beacon).unwrap();
     let _ = socket.set_broadcast(true);
 
-    // Multicast group + limited broadcast + the /24 subnet-directed broadcast.
-    // Broadcast bypasses the router's IGMP snooping (which prunes multicast
-    // between Wi-Fi clients); the directed broadcast routes on-link over Wi-Fi.
-    let mut targets = vec![
+    // Fast path: multicast group + limited broadcast + /24 subnet-directed
+    // broadcast (directed broadcast routes on-link over Wi-Fi).
+    let mut fast = vec![
         SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT),
         SocketAddr::new(Ipv4Addr::BROADCAST.into(), DISCOVERY_PORT),
     ];
+    // Fallback: unicast probe to every /24 host, for networks that drop both
+    // multicast and broadcast but still allow client-to-client unicast.
+    let mut sweep = Vec::new();
     if let Ok(v4) = ip.parse::<Ipv4Addr>() {
         let o = v4.octets();
-        let directed = Ipv4Addr::new(o[0], o[1], o[2], 255);
-        targets.push(SocketAddr::new(directed.into(), DISCOVERY_PORT));
-        // Unicast sweep of the /24. Last-resort discovery for networks that
-        // drop both multicast and broadcast but allow client-to-client unicast.
+        fast.push(SocketAddr::new(Ipv4Addr::new(o[0], o[1], o[2], 255).into(), DISCOVERY_PORT));
         for host in 1..=254u8 {
             if host == o[3] {
                 continue; // skip ourselves
             }
             let ip = Ipv4Addr::new(o[0], o[1], o[2], host);
-            targets.push(SocketAddr::new(ip.into(), DISCOVERY_PORT));
+            sweep.push(SocketAddr::new(ip.into(), DISCOVERY_PORT));
         }
     }
-    info!("beaconing as '{}' -> {} targets", beacon.name, targets.len());
+    info!(
+        "beaconing as '{}': {} fast targets, {} unicast-sweep fallback every {}s",
+        beacon.name,
+        fast.len(),
+        sweep.len(),
+        BEACON_INTERVAL.as_secs() * SWEEP_EVERY_TICKS
+    );
+    let mut tick: u64 = 0;
     loop {
-        for dst in &targets {
+        for dst in &fast {
             if let Err(e) = socket.send_to(&payload, dst) {
-                // EHOSTDOWN(64)/EHOSTUNREACH(65)/ENETUNREACH(51) just mean no
-                // host at that swept address — expected, don't spam the log.
                 if !matches!(e.raw_os_error(), Some(64) | Some(65) | Some(51)) {
                     warn!("beacon send to {dst} error: {e}");
                 }
             }
         }
+        // Throttled unicast fallback (and an immediate sweep on the first tick).
+        if tick % SWEEP_EVERY_TICKS == 0 {
+            for dst in &sweep {
+                let _ = socket.send_to(&payload, dst); // EHOSTDOWN expected, ignore
+            }
+        }
+        tick = tick.wrapping_add(1);
         std::thread::sleep(BEACON_INTERVAL);
     }
 }
