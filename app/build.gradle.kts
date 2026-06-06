@@ -60,6 +60,9 @@ cargo {
     profile = "release"
     cargoCommand = "$cargoBin/cargo"
     rustcCommand = "$cargoBin/rustc"
+    // The plugin's generated linker-wrapper.sh invokes `python`; modern macOS
+    // only ships `python3`, so point it there (override with -Prust.python=...).
+    pythonCommand = (project.findProperty("rust.python") as String?) ?: "python3"
 }
 
 // Make sure the Rust libs are built before Gradle packages the JNI libs.
