@@ -41,6 +41,15 @@ android {
     }
 }
 
+// Locate the Rust toolchain. Android Studio's Gradle daemon often doesn't
+// inherit your shell PATH (esp. when launched from the macOS Dock), so point
+// at the rustup shims directly. Honors CARGO_HOME, else defaults to ~/.cargo.
+// Override per-machine with -Prust.cargoBin=/path/to/cargo/bin if needed.
+val cargoBin: String =
+    (project.findProperty("rust.cargoBin") as String?)
+        ?: System.getenv("CARGO_HOME")?.let { "$it/bin" }
+        ?: "${System.getProperty("user.home")}/.cargo/bin"
+
 // Build the Rust crate (../rust) into per-ABI .so files and bundle them.
 cargo {
     module = "../rust"
@@ -49,6 +58,8 @@ cargo {
     //   arm64 -> arm64-v8a, x86_64 -> x86_64, arm -> armeabi-v7a, x86 -> x86
     targets = listOf("arm64", "x86_64", "arm", "x86")
     profile = "release"
+    cargoCommand = "$cargoBin/cargo"
+    rustcCommand = "$cargoBin/rustc"
 }
 
 // Make sure the Rust libs are built before Gradle packages the JNI libs.
