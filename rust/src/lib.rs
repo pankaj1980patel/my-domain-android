@@ -175,6 +175,7 @@ fn discovery_recv_loop(socket: UdpSocket, peers: Arc<Mutex<HashMap<String, Peer>
 }
 
 fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
+    let ip = identity.ip.clone();
     let beacon = Beacon {
         node_id: identity.node_id,
         name: identity.name,
@@ -182,13 +183,28 @@ fn beacon_send_loop(socket: UdpSocket, identity: Identity) {
         udp_port: identity.udp_port,
     };
     let payload = serde_json::to_vec(&beacon).unwrap();
-    let dst = SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT);
-    info!("beaconing as '{}' -> {}:{}", beacon.name, MCAST_GROUP, DISCOVERY_PORT);
+    let _ = socket.set_broadcast(true);
+
+    // Multicast group + limited broadcast + the /24 subnet-directed broadcast.
+    // Broadcast bypasses the router's IGMP snooping (which prunes multicast
+    // between Wi-Fi clients); the directed broadcast routes on-link over Wi-Fi.
+    let mut targets = vec![
+        SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT),
+        SocketAddr::new(Ipv4Addr::BROADCAST.into(), DISCOVERY_PORT),
+    ];
+    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+        let o = v4.octets();
+        let directed = Ipv4Addr::new(o[0], o[1], o[2], 255);
+        targets.push(SocketAddr::new(directed.into(), DISCOVERY_PORT));
+    }
+    info!("beaconing as '{}' -> {:?}", beacon.name, targets);
     loop {
-        match socket.send_to(&payload, dst) {
-            Ok(n) => info!("beacon sent ({n}B) -> {}:{}", MCAST_GROUP, DISCOVERY_PORT),
-            Err(e) => warn!("beacon send error: {e}"),
+        for dst in &targets {
+            if let Err(e) = socket.send_to(&payload, dst) {
+                warn!("beacon send to {dst} error: {e}");
+            }
         }
+        info!("beacon round sent ({} targets)", targets.len());
         std::thread::sleep(BEACON_INTERVAL);
     }
 }
