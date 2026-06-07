@@ -760,31 +760,6 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSetEncryptionKey<
     ret(&mut env, out)
 }
 
-/// DEV / LAN-only: skip the registry login. Sets a local username + encryption
-/// key (no token, no server contact) so LAN discovery and WebSocket messaging
-/// work between devices on the same network. Both devices must use the SAME
-/// username + key to derive a matching E2EE key. Nothing is persisted.
-#[no_mangle]
-pub extern "system" fn Java_com_mydomain_android_RustNet_nativeDevLogin<'l>(
-    mut env: JNIEnv<'l>, _c: JClass<'l>, username: JString<'l>, passphrase: JString<'l>,
-) -> jstring {
-    let username = jstr(&mut env, &username, "");
-    let passphrase = jstr(&mut env, &passphrase, "");
-    let r = (|| {
-        let state = STATE.get().ok_or("not started")?;
-        let username = username.trim();
-        if username.is_empty() || passphrase.trim().is_empty() {
-            return Err("username and encryption key required".to_string());
-        }
-        let key = derive_key(&passphrase, username).ok_or("failed to derive key")?;
-        *state.session.username.lock().unwrap() = Some(username.to_string());
-        *state.session.key.lock().unwrap() = Some(key);
-        Ok(())
-    })();
-    let out = ok_or_err(r);
-    ret(&mut env, out)
-}
-
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeUpdateEncryptionKey<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>, new_pass: JString<'l>, password: JString<'l>,

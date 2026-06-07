@@ -17,8 +17,6 @@ object RustNet {
     external fun nativeSetEncryptionKey(passphrase: String): String
     external fun nativeUpdateEncryptionKey(newPassphrase: String, password: String): String
     external fun nativeGenerateKey(): String
-    /** DEV / LAN-only: set a local username + encryption key, skipping the registry login. */
-    external fun nativeDevLogin(username: String, passphrase: String): String
     external fun nativeLogout(): String
     /** "true" / "false". */
     external fun nativeIsReady(): String
