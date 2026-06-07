@@ -32,4 +32,7 @@ object RustNet {
 
     external fun nativeGetPeers(): String
     external fun nativePollMessages(): String
+
+    /** JSON array of node_ids with a live WebSocket (true on both ends). */
+    external fun nativeConnectedPeers(): String
 }

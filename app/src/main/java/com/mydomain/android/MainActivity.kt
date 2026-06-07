@@ -167,6 +167,7 @@ fun LoginScreen(prefs: android.content.SharedPreferences, onReady: () -> Unit) {
 @Composable
 fun MainScreen(prefs: android.content.SharedPreferences, onLogout: () -> Unit) {
     var peers by remember { mutableStateOf<List<Peer>>(emptyList()) }
+    var connected by remember { mutableStateOf<Set<String>>(emptySet()) }
     val log = remember { mutableStateListOf<LogEntry>() }
     var selected by remember { mutableStateOf<String?>(null) }
     var protocol by remember { mutableStateOf("WS") }
@@ -180,7 +181,12 @@ fun MainScreen(prefs: android.content.SharedPreferences, onLogout: () -> Unit) {
         while (true) {
             val p = withContext(Dispatchers.IO) { runCatching { parsePeers(RustNet.nativeGetPeers()) }.getOrDefault(emptyList()) }
             val msgs = withContext(Dispatchers.IO) { runCatching { RustNet.nativePollMessages() }.getOrDefault("[]") }
+            val conn = withContext(Dispatchers.IO) { runCatching { RustNet.nativeConnectedPeers() }.getOrDefault("[]") }
             peers = p
+            connected = runCatching {
+                val a = JSONArray(conn)
+                (0 until a.length()).map { a.getString(it) }.toSet()
+            }.getOrDefault(emptySet())
             if (selected == null && p.isNotEmpty()) selected = p.first().nodeId
             val arr = JSONArray(msgs)
             for (i in 0 until arr.length()) {
@@ -212,9 +218,13 @@ fun MainScreen(prefs: android.content.SharedPreferences, onLogout: () -> Unit) {
                         Text("${p.ip} · tcp ${p.tcpPort} · udp ${p.udpPort} · ws ${p.wsPort}", fontSize = 11.sp)
                     }
                     if (p.wsPort != 0) {
-                        OutlinedButton(onClick = {
-                            scope.launch { val e = withContext(Dispatchers.IO) { RustNet.nativeConnectWs(p.nodeId) }; status = if (e.isEmpty()) "WS connected to ${p.name}" else e }
-                        }) { Text("WS", fontSize = 12.sp) }
+                        val isConnected = connected.contains(p.nodeId)
+                        OutlinedButton(
+                            enabled = !isConnected,
+                            onClick = {
+                                scope.launch { val e = withContext(Dispatchers.IO) { RustNet.nativeConnectWs(p.nodeId) }; if (e.isNotEmpty()) status = e }
+                            },
+                        ) { Text(if (isConnected) "WS ✓" else "WS", fontSize = 12.sp) }
                     }
                 }
             }

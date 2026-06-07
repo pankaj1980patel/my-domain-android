@@ -927,3 +927,19 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativePollMessages<'l>(
         .unwrap_or_else(|| "[]".into());
     ret(&mut env, json)
 }
+
+/// node_ids of peers with a live WebSocket. Reads the actual conn map, so this
+/// is true on the accepting side too — not just the side that dialed.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeConnectedPeers<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>,
+) -> jstring {
+    let json = STATE
+        .get()
+        .map(|s| {
+            let ids: Vec<String> = s.ws_conns.lock().unwrap().keys().cloned().collect();
+            serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+        })
+        .unwrap_or_else(|| "[]".into());
+    ret(&mut env, json)
+}
