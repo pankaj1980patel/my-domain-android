@@ -158,6 +158,21 @@ fun LoginScreen(prefs: android.content.SharedPreferences, onReady: () -> Unit) {
             Button(onClick = { submit(false) }, modifier = Modifier.weight(1f)) { Text("Log in") }
             OutlinedButton(onClick = { submit(true) }, modifier = Modifier.weight(1f)) { Text("Register") }
         }
+        // DEV / LAN-only: skip the registry. Needs just a username + encryption key;
+        // LAN discovery and WS messaging work between devices that share both.
+        OutlinedButton(
+            onClick = {
+                if (user.isBlank() || key.isBlank()) {
+                    status = "Username and encryption key required for LAN mode."; return@OutlinedButton
+                }
+                val e = RustNet.nativeDevLogin(user, key)
+                if (e.isEmpty()) {
+                    prefs.edit().putString("user", user).apply()
+                    onReady()
+                } else status = e.removePrefix("ERROR: ")
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Skip login (LAN only)") }
         if (status.isNotEmpty()) Text(status, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
         Text("Use the SAME encryption key on all your devices.", fontSize = 12.sp)
     }
