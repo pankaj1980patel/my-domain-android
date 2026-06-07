@@ -73,6 +73,16 @@ tasks.whenTaskAdded {
     }
 }
 
+// rust-android-gradle 0.9.x does not reliably invalidate cargoBuild when only the
+// Rust sources change, so a previously-built libmydomain_net.so can stay packaged
+// in the APK even after adding/changing native methods — surfacing at runtime as
+// `UnsatisfiedLinkError: No implementation found for ...nativeXxx`. Force the cargo
+// tasks to always run; cargo's own incremental compilation keeps this cheap when
+// nothing changed.
+tasks.matching { it.name.startsWith("cargoBuild") }.configureEach {
+    outputs.upToDateWhen { false }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.9.3")
