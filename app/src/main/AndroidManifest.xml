@@ -12,6 +12,7 @@
         android:icon="@android:drawable/sym_def_app_icon"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.App">
 
         <!-- Cleartext is fine here: this is plain LAN UDP/TCP between trusted peers. -->
