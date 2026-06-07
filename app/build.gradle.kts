@@ -73,14 +73,16 @@ tasks.whenTaskAdded {
     }
 }
 
-// rust-android-gradle 0.9.x does not reliably invalidate cargoBuild when only the
-// Rust sources change, so a previously-built libmydomain_net.so can stay packaged
-// in the APK even after adding/changing native methods — surfacing at runtime as
-// `UnsatisfiedLinkError: No implementation found for ...nativeXxx`. Force the cargo
-// tasks to always run; cargo's own incremental compilation keeps this cheap when
-// nothing changed.
+// Tell Gradle not to snapshot the cargo tasks' inputs/outputs. Two reasons:
+//  1. rust-android-gradle 0.9.x exposes the AGP `Ndk` object as a task input, which
+//     Gradle 8.x cannot serialize when fingerprinting — it aborts the build with
+//     "Cannot fingerprint input property 'ndk' ... cannot be serialized" (worse with
+//     a -beta NDK). doNotTrackState skips that fingerprinting, so the build proceeds.
+//  2. The plugin doesn't reliably invalidate cargoBuild on Rust-only changes, which
+//     could leave a stale libmydomain_net.so in the APK (=> runtime UnsatisfiedLinkError).
+// Untracked tasks always run; cargo's own incremental compilation keeps that cheap.
 tasks.matching { it.name.startsWith("cargoBuild") }.configureEach {
-    outputs.upToDateWhen { false }
+    doNotTrackState("cargo manages its own incrementality; avoids non-serializable NDK input")
 }
 
 dependencies {
