@@ -1,95 +1,62 @@
-# my-domain · Android
+# my-domain Android
 
-Native Android client for the **my-domain** LAN messenger. The **networking is
-written in Rust** (the `rust/` crate) and compiled to a `.so` that the Kotlin /
-Jetpack Compose UI calls over JNI — so this app speaks the *exact same wire
-protocol* as the [desktop](https://github.com/pankaj1980patel/my-domain-desktop)
-app and the two discover and message each other on the same LAN.
+A secure, multi-protocol LAN messenger for Android, featuring end-to-end encryption (E2EE) and hybrid discovery.
 
-## Architecture
+## Project Overview
 
-```
-app/  (Kotlin + Jetpack Compose)         rust/  (Rust, crate-type = cdylib)
-  MainActivity.kt  ── UI + polling          src/lib.rs
-  RustNet.kt       ── JNI bindings ───────►   Java_com_mydomain_android_RustNet_*
-                                              ├─ UDP multicast discovery (beacons)
-                                              ├─ TCP listener  (recv messages)
-                                              ├─ UDP socket    (recv messages)
-                                              └─ peer table + inbox queue
-```
+The "my-domain" Android app is designed for private communication over local networks. It leverages a high-performance Rust core to handle networking and cryptography, providing a robust foundation for secure messaging.
 
-The Kotlin side calls four native functions (all exchange JSON strings):
+### Key Features
 
-| Kotlin                       | Purpose                                            |
-|------------------------------|----------------------------------------------------|
-| `nativeStart(name)`          | start discovery + listeners (idempotent); returns identity |
-| `nativeGetPeers()`           | current discovered peers                           |
-| `nativePollMessages()`       | drain newly received messages                      |
-| `nativeSend(nodeId, proto, text)` | send a message over `"UDP"` or `"TCP"`        |
+*   **End-to-End Encryption (E2EE):** All messages are encrypted/decrypted using `XChaCha20Poly1305`. Keys are derived locally using Argon2 from a user-defined passphrase, ensuring that even the registry server cannot read the messages.
+*   **Hybrid Peer Discovery:**
+    *   **Registry-Based:** Authenticated users register their IP and ports with a central server and fetch other registered devices.
+    *   **LAN Discovery:** Uses UDP Multicast (239.255.42.98:45678) and subnet-wide broadcasting to find peers on the same network without requiring a server.
+*   **Multi-Protocol Messaging:**
+    *   **UDP:** Low-overhead encrypted packets.
+    *   **TCP:** Reliable one-off encrypted connections.
+    *   **WebSocket (WS):** Persistent, bidirectional encrypted channels for low-latency LAN communication.
+*   **Privacy First:** The registry server only acts as a directory; it never sees plaintext messages or encryption keys.
 
-The UI polls `nativeGetPeers` / `nativePollMessages` once a second.
+## Technical Architecture
 
-## Shared wire protocol (must match desktop)
+### 1. Android UI (Kotlin & Jetpack Compose)
+The frontend is a modern Jetpack Compose application.
+*   **`MainActivity.kt`**: Manages the application lifecycle, UI state, and network connectivity monitoring. It acquires a `WifiManager.MulticastLock` to enable reliable LAN discovery.
+*   **`RustNet.kt`**: Acts as the JNI (Java Native Interface) bridge, exposing the Rust core's functionality to the Kotlin layer.
 
-- **Beacon** — UDP multicast `239.255.42.98:45678`, every ~2s:
-  `{"node_id":"…","name":"…","tcp_port":<int>,"udp_port":<int>}`
-- **Message** — JSON body of a TCP connection, or a single UDP datagram to the
-  peer's advertised port: `{"from":"…","text":"…"}`
+### 2. Rust Core (`rust/src/lib.rs`)
+The "brain" of the application, written in Rust for safety and performance.
+*   **State Management:** Maintains `NetState`, tracking local identity, peer lists, and active connections.
+*   **Networking Loops:** Spawns dedicated threads for:
+    *   UDP Multicast discovery.
+    *   TCP listener for incoming messages.
+    *   UDP listener for incoming packets.
+    *   WebSocket server for persistent peer connections.
+*   **Cryptography:** Implements the E2EE logic using the `chacha20poly1305` and `argon2` crates.
 
-> Android requires a `WifiManager.MulticastLock` to receive multicast — it is
-> acquired in `MainActivity.onCreate()` before `nativeStart()` and released in
-> `onDestroy()`. Manifest permissions: `INTERNET`, `ACCESS_NETWORK_STATE`,
-> `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE`.
+### 3. JNI Bridge
+Data is exchanged between Kotlin and Rust primarily through JSON strings, allowing for flexible and type-safe communication of complex structures like peer lists and message logs.
 
-## Prerequisites
+## Security Model
 
-1. **Android Studio** (Ladybug+), with the **Android SDK** and **NDK** installed
-   (SDK Manager → SDK Tools → *NDK (Side by side)*).
-2. **Rust** + the Android targets:
-   ```bash
-   rustup target add aarch64-linux-android armv7-linux-androideabi \
-                     i686-linux-android x86_64-linux-android
-   ```
-3. Point Gradle at your NDK — either set `ANDROID_NDK_HOME`, or add to
-   `local.properties` (Android Studio usually writes `sdk.dir` for you):
-   ```
-   sdk.dir=/Users/you/Library/Android/sdk
-   ndk.dir=/Users/you/Library/Android/sdk/ndk/<version>
-   ```
+1.  **Key Derivation:** A user's encryption key is derived from their `username` and a `passphrase` using Argon2.
+2.  **Message Encryption:** Each message is wrapped in an `Envelope` containing a random 24-byte nonce and the ciphertext.
+3.  **Authentication:** The app uses JWT-based authentication with a central registry for global identity, but also supports a "LAN-only" mode that skips the server entirely.
 
-## Build & run
+## Development
 
-Easiest path — **open the `android/` folder in Android Studio** and press Run.
-On first open, Android Studio provisions the Gradle wrapper JAR
-(`gradle/wrapper/gradle-wrapper.jar`, not committed here) and downloads Gradle
-8.10.2. The `rust-android-gradle` plugin builds the Rust crate automatically as
-part of the Android build.
+### Prerequisites
+*   Android Studio
+*   Rust toolchain (with `aarch64-linux-android`, `armv7-linux-androideabi`, etc., targets)
+*   `cargo-ndk` for building the Rust JNI library.
 
-From the command line (after the wrapper JAR exists — `gradle wrapper` or the
-first Android Studio sync creates it):
+### Building
+The Rust module is automatically built as part of the Gradle build process (configured in `app/build.gradle.kts`).
 
 ```bash
-./gradlew assembleDebug          # builds the .so for all ABIs + the APK
-./gradlew installDebug           # install on a connected device
-# or build just the native libs:
-./gradlew cargoBuild
+./gradlew assembleDebug
 ```
 
-## Testing desktop ⇄ Android
-
-1. Run the [desktop](https://github.com/pankaj1980patel/my-domain-desktop) app on
-   a computer.
-2. Put the Android device on the **same Wi-Fi** and launch this app.
-3. Each appears in the other's **Peers** list; send messages either way over UDP
-   or TCP.
-
-> Many guest / corporate / "client-isolation" Wi-Fi networks block UDP multicast
-> and peer-to-peer traffic. Use a normal home network or a phone hotspot.
-
-## Notes
-
-- Package / `applicationId`: `com.mydomain.android`. The JNI symbol names in
-  `rust/src/lib.rs` (`Java_com_mydomain_android_RustNet_*`) are derived from this
-  package + the `RustNet` class name — keep them in sync if you rename.
-- `cargo` target names in `app/build.gradle.kts` map to ABIs: `arm64`→arm64-v8a,
-  `x86_64`→x86_64, `arm`→armeabi-v7a, `x86`→x86.
+## Contributing
+The project is divided into the Android frontend (`/app`) and the Rust backend (`/rust`). Ensure any changes to the JNI interface in `lib.rs` are reflected in `RustNet.kt`.
