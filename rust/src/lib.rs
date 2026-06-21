@@ -600,8 +600,14 @@ fn do_send(state: &NetState, node_id: &str, protocol: &str, text: &str) -> Resul
     }
 }
 
-fn build_state(name: String, wifi_ip: String) -> NetState {
-    let node_id = uuid::Uuid::new_v4().to_string();
+fn build_state(device_id: String, name: String, wifi_ip: String) -> NetState {
+    // Stable, hardware-derived id (Android ANDROID_ID) so the same phone keeps
+    // one registry row across restarts; fall back to random only if absent.
+    let node_id = if device_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        device_id
+    };
     let iface: Ipv4Addr = wifi_ip
         .parse()
         .unwrap_or_else(|_| local_ip().parse().unwrap_or(Ipv4Addr::UNSPECIFIED));
@@ -705,6 +711,7 @@ fn ok_or_err(r: Result<(), String>) -> String {
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'l>(
     mut env: JNIEnv<'l>,
     _c: JClass<'l>,
+    device_id: JString<'l>,
     name: JString<'l>,
     wifi_ip: JString<'l>,
 ) -> jstring {
@@ -713,9 +720,10 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'l>(
             .with_max_level(log::LevelFilter::Info)
             .with_tag("mydomain_net"),
     );
+    let device_id = jstr(&mut env, &device_id, "");
     let name = jstr(&mut env, &name, "android");
     let wifi_ip = jstr(&mut env, &wifi_ip, "");
-    let state = STATE.get_or_init(|| build_state(name, wifi_ip));
+    let state = STATE.get_or_init(|| build_state(device_id, name, wifi_ip));
     let json = serde_json::to_string(&state.identity.lock().unwrap().clone()).unwrap_or_else(|_| "{}".into());
     ret(&mut env, json)
 }

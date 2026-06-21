@@ -1,12 +1,16 @@
 package com.mydomain.android
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.MaterialTheme
@@ -33,6 +37,19 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Ask for READ_PHONE_STATE so a later launch can use the IMEI as the
+        // device id (this launch falls back to ANDROID_ID — the service, which
+        // resolves the id, starts immediately below and the id is set once).
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            runCatching {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.READ_PHONE_STATE), 1001
+                )
+            }
+        }
 
         // Start the background service for networking and clipboard sync
         val serviceIntent = Intent(this, NetService::class.java)

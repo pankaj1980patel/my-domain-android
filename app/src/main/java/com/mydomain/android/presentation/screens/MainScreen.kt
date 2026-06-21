@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.mydomain.android.LogEntry
+import com.mydomain.android.NetService
 import com.mydomain.android.Peer
 import com.mydomain.android.RustNet
 import com.mydomain.android.core.NetworkingUtils.parsePeers
@@ -71,6 +72,7 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
     var status by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var clipSync by remember { mutableStateOf(NetService.clipboardSyncEnabled) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -83,9 +85,16 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                     val text = o.optString("text")
                     try {
                         val json = JSONObject(text)
-                        if (json.optString("type") == "clipboard") {
-                            log.add(0, LogEntry("in", o.optString("from"), o.optString("ip"), o.optString("protocol"), "📋 Clipboard Synced", o.optBoolean("ok", true)))
-                            return@runCatching
+                        when (json.optString("type")) {
+                            "clipboard" -> {
+                                log.add(0, LogEntry("in", o.optString("from"), o.optString("ip"), o.optString("protocol"), "📋 Clipboard Synced", o.optBoolean("ok", true)))
+                                return@runCatching
+                            }
+                            "clipboard_response" -> {
+                                log.add(0, LogEntry("in", o.optString("from"), o.optString("ip"), o.optString("protocol"), "📋 Clipboard received: ${json.optString("content")}", o.optBoolean("ok", true)))
+                                return@runCatching
+                            }
+                            "clipboard_request" -> return@runCatching // internal; no log
                         }
                     } catch (_: Exception) { }
                     log.add(0, LogEntry("in", o.optString("from"), o.optString("ip"), o.optString("protocol"), text, o.optBoolean("ok", true)))
@@ -205,6 +214,45 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                 if (status.isNotEmpty()) {
                     Text(status, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 4.dp))
                 }
+            }
+
+            // --- CLIPBOARD SECTION ---
+            item {
+                Spacer(Modifier.height(12.dp))
+                Text("Clipboard", fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(bottom = 4.dp))
+
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Auto-sync (active)", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    FilterChip(
+                        selected = clipSync,
+                        onClick = {
+                            clipSync = !clipSync
+                            NetService.clipboardSyncEnabled = clipSync
+                            prefs.edit().putBoolean("clip_sync", clipSync).apply()
+                            status = if (clipSync) "Clipboard auto-sync enabled" else "Clipboard auto-sync disabled"
+                        },
+                        label = { Text(if (clipSync) "On" else "Off") },
+                    )
+                }
+
+                Button(
+                    enabled = selected != null,
+                    onClick = {
+                        val node = selected ?: return@Button
+                        val req = JSONObject().apply {
+                            put("type", "clipboard_request")
+                            put("from", NetService.myNodeId)
+                        }.toString()
+                        scope.launch {
+                            val e = withContext(Dispatchers.IO) {
+                                val proto = if (connected.contains(node)) "WS" else "UDP"
+                                RustNet.nativeSend(node, proto, req)
+                            }
+                            status = if (e.isEmpty()) "Requested clipboard from ${sel?.name ?: "peer"}…" else e.removePrefix("ERROR: ")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                ) { Text("Get clipboard (once)") }
             }
 
             // --- MESSAGES SECTION HEADER ---

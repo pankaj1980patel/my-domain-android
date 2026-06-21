@@ -10,7 +10,7 @@ object RustNet {
     }
 
     /** Start networking (LAN listeners + WS server). Returns identity JSON. */
-    external fun nativeStart(name: String, wifiIp: String): String
+    external fun nativeStart(deviceId: String, name: String, wifiIp: String): String
 
     external fun nativeAuthLogin(serverUrl: String, username: String, password: String): String
     external fun nativeAuthRegister(serverUrl: String, username: String, password: String): String

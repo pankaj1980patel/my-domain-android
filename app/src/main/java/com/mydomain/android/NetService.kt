@@ -7,8 +7,11 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.*
+import android.provider.Settings
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.mydomain.android.core.NetworkingUtils.wifiIpv4
 import kotlinx.coroutines.*
 import org.json.JSONArray
@@ -57,11 +60,38 @@ class NetService : Service() {
             startForeground(1, createNotification())
         }
 
-        // Initialize Rust core if not already done
+        // Restore the clipboard auto-sync ("active" mode) toggle.
+        clipboardSyncEnabled = getSharedPreferences("md", MODE_PRIVATE).getBoolean("clip_sync", false)
+
+        // Initialize Rust core if not already done. Prefer the IMEI as a stable
+        // device id; on Android 10+ that's unreadable for normal apps, so fall
+        // back to ANDROID_ID (also stable across restarts/reinstalls).
         val ip = wifiIpv4()
-        RustNet.nativeStart(Build.MODEL ?: "android", ip)
+        val identityJson = RustNet.nativeStart(resolveDeviceId(), Build.MODEL ?: "android", ip)
+        runCatching { myNodeId = JSONObject(identityJson).optString("node_id", "") }
 
         startNetworking()
+    }
+
+    /**
+     * Best-effort stable device id. Tries the IMEI (requires READ_PHONE_STATE and
+     * is only obtainable by privileged apps on API 29+), and falls back to
+     * ANDROID_ID — Google's official, permission-free device-id replacement.
+     */
+    private fun resolveDeviceId(): String {
+        imei()?.takeIf { it.isNotBlank() }?.let { return it }
+        return Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+    }
+
+    @Suppress("HardwareIds", "DEPRECATION", "MissingPermission")
+    private fun imei(): String? {
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_PHONE_STATE)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return null
+        val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return null
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) tm.imei else tm.deviceId
+        }.getOrNull()
     }
 
     private fun createNotificationChannel() {
@@ -138,14 +168,17 @@ class NetService : Service() {
             }
         }
         
-        // Listen for local clipboard changes to SYNC TO OTHERS
+        // Track the local clipboard. We always remember the latest value (so we
+        // can answer passive "get clipboard" pulls), but only broadcast changes
+        // to peers while ACTIVE auto-sync is enabled.
         Handler(Looper.getMainLooper()).post {
             clipboard.addPrimaryClipChangedListener {
                 val clip = clipboard.primaryClip
                 if (clip != null && clip.itemCount > 0) {
                     val text = clip.getItemAt(0).text?.toString()
                     if (text != null && !text.startsWith("SYNC_IGNORE:")) { // Avoid loops if we use a prefix
-                        syncClipboard(text)
+                        currentLocalClip = text
+                        if (clipboardSyncEnabled) syncClipboard(text)
                     }
                 }
             }
@@ -153,21 +186,59 @@ class NetService : Service() {
     }
 
     private var lastReceivedClipboard: String? = null
+    /** Latest known local clipboard text, used to answer passive pull requests. */
+    private var currentLocalClip: String = ""
 
     private fun handleIncomingMessage(msg: JSONObject) {
         val text = msg.optString("text", "")
-        try {
-            val json = JSONObject(text)
-            if (json.optString("type") == "clipboard") {
-                val content = json.getString("content")
+        val json = try { JSONObject(text) } catch (e: Exception) { return } // regular chat
+        when (json.optString("type")) {
+            // Unsolicited push from a peer in active mode: only apply if we also
+            // have auto-sync enabled.
+            "clipboard" -> {
+                if (!clipboardSyncEnabled) return
+                val content = json.optString("content")
                 if (content != lastReceivedClipboard) {
                     lastReceivedClipboard = content
                     updateLocalClipboard(content)
                 }
             }
-        } catch (e: Exception) {
-            // Regular chat message
+            // A peer is pulling our clipboard: reply with the latest known value.
+            "clipboard_request" -> {
+                val requester = json.optString("from")
+                if (requester.isNotEmpty()) {
+                    val resp = JSONObject().apply {
+                        put("type", "clipboard_response")
+                        put("content", currentLocalClip)
+                        put("from", myNodeId)
+                    }.toString()
+                    sendClip(requester, resp)
+                }
+            }
+            // Reply to a pull we initiated: always apply (it was solicited).
+            "clipboard_response" -> {
+                val content = json.optString("content")
+                lastReceivedClipboard = content
+                updateLocalClipboard(content)
+            }
         }
+    }
+
+    /** Send a clipboard control message to one peer (WS if connected, else UDP). */
+    private fun sendClip(nodeId: String, json: String) {
+        serviceScope.launch {
+            val proto = if (connectedPeerSet().contains(nodeId)) "WS" else "UDP"
+            RustNet.nativeSend(nodeId, proto, json)
+        }
+    }
+
+    private fun connectedPeerSet(): Set<String> {
+        val set = mutableSetOf<String>()
+        runCatching {
+            val arr = JSONArray(RustNet.nativeConnectedPeers())
+            for (i in 0 until arr.length()) set.add(arr.getString(i))
+        }
+        return set
     }
 
     private fun updateLocalClipboard(content: String) {
@@ -218,5 +289,12 @@ class NetService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return START_STICKY
+    }
+
+    companion object {
+        /** ACTIVE clipboard auto-sync on/off. Shared with the UI (same process). */
+        @Volatile var clipboardSyncEnabled = false
+        /** This device's node_id, captured from the Rust identity on start. */
+        @Volatile var myNodeId = ""
     }
 }
