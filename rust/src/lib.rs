@@ -1,695 +1,152 @@
-// my-domain Android core (Rust, exposed to Kotlin over JNI).
+// my-domain Android core — a thin JNI adapter over the shared `mdcore` Engine.
 //
-// Mirrors the desktop backend: login (JWT) + encryption key gate, registry-based
-// discovery (register on login / network change, fetch peers — no polling of the
-// server), manual LAN scan, and end-to-end encrypted messaging over UDP / TCP /
-// LAN WebSocket. The server is a directory only; it never sees plaintext or keys.
+// Platform specifics (device id + name + Wi-Fi IP passed from Kotlin, the
+// single-interface multicast strategy, and the poll-based inbox) live here; all
+// networking, crypto, discovery, and messaging live in `mdcore`.
 //
 // Kotlin drives this by calling the `native*` functions and polling
-// `nativeGetPeers` / `nativePollMessages`.
+// `nativeGetPeers` / `nativePollMessages` / `nativeConnectedPeers`.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    XChaCha20Poly1305, XNonce,
-};
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
-use log::{info, warn};
-use rand_core::{OsRng, RngCore};
-use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol, Socket, Type};
+use log::info;
 
-const MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 98);
-const DISCOVERY_PORT: u16 = 45678;
+use mdcore::engine::Engine;
+use mdcore::events::{CoreEvent, EventSink};
+use mdcore::model::IncomingMessage;
+use mdcore::platform::{detect_local_ip, IfaceMode, Platform};
+
 const INBOX_CAP: usize = 500;
 
-static WS_CONN_SEQ: AtomicU64 = AtomicU64::new(1);
-
 // ---------------------------------------------------------------------------
-// Data model
+// Platform implementation
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Serialize)]
-struct Identity {
-    node_id: String,
+struct AndroidPlatform {
+    device_id: String,
     name: String,
-    ip: String,
-    tcp_port: u16,
-    udp_port: u16,
-    ws_port: u16,
+    /// Updated on network change; shared so `nativeNetworkChanged` can mutate it.
+    wifi_ip: Arc<Mutex<String>>,
+    /// Set from Kotlin via `nativeSetFcmToken` once Firebase issues it.
+    fcm_token: Arc<Mutex<Option<String>>>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Beacon {
-    node_id: String,
-    name: String,
-    tcp_port: u16,
-    udp_port: u16,
-    ws_port: u16,
-    #[serde(default)]
-    reply: bool,
-}
-
-#[derive(Clone, Serialize)]
-struct Peer {
-    node_id: String,
-    name: String,
-    ip: String,
-    tcp_port: u16,
-    udp_port: u16,
-    ws_port: u16,
-    source: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Plaintext {
-    from: String,
-    text: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Envelope {
-    nonce: String,
-    ciphertext: String,
-}
-
-#[derive(Clone, Serialize)]
-struct IncomingMessage {
-    from: String,
-    ip: String,
-    protocol: String,
-    text: String,
-    ts: u64,
-    ok: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum WsFrame {
-    #[serde(rename = "hello")]
-    Hello { node_id: String, name: String },
-    #[serde(rename = "msg")]
-    Msg { nonce: String, ciphertext: String },
-}
-
-type PeerMap = Arc<Mutex<HashMap<String, Peer>>>;
-type Inbox = Arc<Mutex<VecDeque<IncomingMessage>>>;
-type KeyHolder = Arc<Mutex<Option<[u8; 32]>>>;
-type WsConns = Arc<Mutex<HashMap<String, (u64, mpsc::Sender<String>)>>>;
-
-struct Session {
-    server_url: Mutex<Option<String>>,
-    token: Mutex<Option<String>>,
-    username: Mutex<Option<String>>,
-    key: KeyHolder,
-}
-
-struct NetState {
-    identity: Arc<Mutex<Identity>>,
-    peers: PeerMap,
-    inbox: Inbox,
-    disco_send: Arc<UdpSocket>,
-    ws_conns: WsConns,
-    session: Session,
-}
-
-static STATE: OnceLock<NetState> = OnceLock::new();
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn push_inbox(inbox: &Inbox, msg: IncomingMessage) {
-    let mut q = inbox.lock().unwrap();
-    if q.len() >= INBOX_CAP {
-        q.pop_front();
-    }
-    q.push_back(msg);
-}
-
-// ---------------------------------------------------------------------------
-// E2EE
-// ---------------------------------------------------------------------------
-
-fn derive_key(passphrase: &str, username: &str) -> Option<[u8; 32]> {
-    let salt = format!("my-domain-e2ee:{username}");
-    let mut key = [0u8; 32];
-    argon2::Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt.as_bytes(), &mut key)
-        .ok()?;
-    Some(key)
-}
-
-fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Option<Envelope> {
-    let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-    let ct = cipher.encrypt(XNonce::from_slice(&nonce), plaintext).ok()?;
-    Some(Envelope {
-        nonce: STANDARD.encode(nonce),
-        ciphertext: STANDARD.encode(ct),
-    })
-}
-
-fn decrypt(key: &[u8; 32], env: &Envelope) -> Option<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
-    let nonce = STANDARD.decode(&env.nonce).ok()?;
-    if nonce.len() != 24 {
-        return None;
-    }
-    let ct = STANDARD.decode(&env.ciphertext).ok()?;
-    cipher.decrypt(XNonce::from_slice(&nonce), ct.as_ref()).ok()
-}
-
-fn envelope_to_message(key: &KeyHolder, env: &Envelope, ip: String, protocol: &str) -> IncomingMessage {
-    if let Some(k) = key.lock().unwrap().as_ref() {
-        if let Some(pt) = decrypt(k, env) {
-            if let Ok(msg) = serde_json::from_slice::<Plaintext>(&pt) {
-                return IncomingMessage {
-                    from: msg.from,
-                    ip,
-                    protocol: protocol.into(),
-                    text: msg.text,
-                    ts: now_secs(),
-                    ok: true,
-                };
-            }
-        }
-    }
-    IncomingMessage {
-        from: "(unknown)".into(),
-        ip,
-        protocol: protocol.into(),
-        text: "🔒 message could not be decrypted (wrong encryption key)".into(),
-        ts: now_secs(),
-        ok: false,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Registry HTTP client
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct TokenResp {
-    token: String,
-    username: String,
-}
-
-#[derive(Deserialize)]
-struct RegistryDevice {
-    node_id: String,
-    name: String,
-    ip: String,
-    tcp_port: u16,
-    udp_port: u16,
-    #[serde(default)]
-    ws_port: u16,
-}
-
-/// Normalize a user-entered server URL to just `scheme://host[:port]`, dropping
-/// any path/query so pasting a full endpoint (e.g. `.../auth/login`) doesn't get
-/// the path appended twice.
-fn base(url: &str) -> String {
-    let u = url.trim().trim_end_matches('/');
-    match u.find("://") {
-        Some(i) => {
-            let host_start = i + 3;
-            let host_end = u[host_start..]
-                .find('/')
-                .map(|j| host_start + j)
-                .unwrap_or(u.len());
-            u[..host_end].to_string()
-        }
-        None => u.to_string(),
-    }
-}
-
-fn http_err(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, r) => r
-            .into_json::<serde_json::Value>()
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-            .unwrap_or_else(|| format!("server returned HTTP {code}")),
-        other => other.to_string(),
-    }
-}
-
-fn auth_call(url: &str, path: &str, username: &str, password: &str) -> Result<TokenResp, String> {
-    ureq::post(&format!("{}{}", base(url), path))
-        .timeout(Duration::from_secs(10))
-        .send_json(serde_json::json!({ "username": username, "password": password }))
-        .map_err(http_err)?
-        .into_json::<TokenResp>()
-        .map_err(|e| e.to_string())
-}
-
-fn verify_password_call(url: &str, username: &str, password: &str) -> Result<bool, String> {
-    match ureq::post(&format!("{}/auth/verify", base(url)))
-        .timeout(Duration::from_secs(10))
-        .send_json(serde_json::json!({ "username": username, "password": password }))
-    {
-        Ok(_) => Ok(true),
-        Err(ureq::Error::Status(401, _)) => Ok(false),
-        Err(e) => Err(http_err(e)),
-    }
-}
-
-fn registry_register(url: &str, token: &str, id: &Identity) -> Result<(), String> {
-    ureq::post(&format!("{}/devices/register", base(url)))
-        .timeout(Duration::from_secs(10))
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(serde_json::json!({
-            "node_id": id.node_id, "name": id.name, "ip": id.ip,
-            "tcp_port": id.tcp_port, "udp_port": id.udp_port, "ws_port": id.ws_port,
-        }))
-        .map_err(http_err)?;
-    Ok(())
-}
-
-fn registry_fetch(url: &str, token: &str, exclude: &str) -> Result<Vec<RegistryDevice>, String> {
-    ureq::get(&format!("{}/devices?exclude={}", base(url), exclude))
-        .timeout(Duration::from_secs(10))
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .map_err(http_err)?
-        .into_json::<Vec<RegistryDevice>>()
-        .map_err(|e| e.to_string())
-}
-
-fn apply_registry_peers(peers: &PeerMap, devices: Vec<RegistryDevice>) {
-    let mut map = peers.lock().unwrap();
-    map.retain(|_, p| p.source != "registry");
-    for d in devices {
-        map.insert(
-            d.node_id.clone(),
-            Peer {
-                node_id: d.node_id,
-                name: d.name,
-                ip: d.ip,
-                tcp_port: d.tcp_port,
-                udp_port: d.udp_port,
-                ws_port: d.ws_port,
-                source: "registry".into(),
-            },
-        );
-    }
-}
-
-/// Register + fetch peers (used after login and on network change).
-fn do_refresh(state: &NetState) -> Result<(), String> {
-    let url = state.session.server_url.lock().unwrap().clone().ok_or("not logged in")?;
-    let token = state.session.token.lock().unwrap().clone().ok_or("not logged in")?;
-    let id = state.identity.lock().unwrap().clone();
-    registry_register(&url, &token, &id)?;
-    let devices = registry_fetch(&url, &token, &id.node_id)?;
-    apply_registry_peers(&state.peers, devices);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// LAN discovery
-// ---------------------------------------------------------------------------
-
-fn local_ip() -> String {
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            Ok(s.local_addr()?.ip().to_string())
-        })
-        .unwrap_or_else(|_| "0.0.0.0".to_string())
-}
-
-fn bind_multicast(iface: Ipv4Addr) -> std::io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.bind(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DISCOVERY_PORT).into())?;
-    socket.join_multicast_v4(&MCAST_GROUP, &iface)?;
-    socket.set_multicast_if_v4(&iface)?;
-    socket.set_multicast_loop_v4(true)?;
-    Ok(socket.into())
-}
-
-fn lan_targets(ip: &str) -> Vec<SocketAddr> {
-    let mut v = vec![
-        SocketAddr::new(MCAST_GROUP.into(), DISCOVERY_PORT),
-        SocketAddr::new(Ipv4Addr::BROADCAST.into(), DISCOVERY_PORT),
-    ];
-    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-        let o = v4.octets();
-        v.push(SocketAddr::new(Ipv4Addr::new(o[0], o[1], o[2], 255).into(), DISCOVERY_PORT));
-        for host in 1..=254u8 {
-            if host == o[3] {
-                continue;
-            }
-            v.push(SocketAddr::new(Ipv4Addr::new(o[0], o[1], o[2], host).into(), DISCOVERY_PORT));
-        }
-    }
-    v
-}
-
-fn send_beacon(socket: &UdpSocket, id: &Identity, reply: bool, to: &[SocketAddr]) {
-    let beacon = Beacon {
-        node_id: id.node_id.clone(),
-        name: id.name.clone(),
-        tcp_port: id.tcp_port,
-        udp_port: id.udp_port,
-        ws_port: id.ws_port,
-        reply,
-    };
-    if let Ok(payload) = serde_json::to_vec(&beacon) {
-        let _ = socket.set_broadcast(true);
-        for dst in to {
-            if let Err(e) = socket.send_to(&payload, dst) {
-                if !matches!(e.raw_os_error(), Some(64) | Some(65) | Some(51)) {
-                    warn!("beacon send to {dst}: {e}");
-                }
-            }
-        }
-    }
-}
-
-fn discovery_recv_loop(recv: UdpSocket, send: Arc<UdpSocket>, peers: PeerMap, identity: Arc<Mutex<Identity>>) {
-    let mut buf = [0u8; 2048];
-    loop {
-        let (len, src) = match recv.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let beacon: Beacon = match serde_json::from_slice(&buf[..len]) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        if beacon.node_id == identity.lock().unwrap().node_id {
-            continue;
-        }
-        peers.lock().unwrap().insert(
-            beacon.node_id.clone(),
-            Peer {
-                node_id: beacon.node_id.clone(),
-                name: beacon.name.clone(),
-                ip: src.ip().to_string(),
-                tcp_port: beacon.tcp_port,
-                udp_port: beacon.udp_port,
-                ws_port: beacon.ws_port,
-                source: "lan".into(),
-            },
-        );
-        if !beacon.reply {
-            let id = identity.lock().unwrap().clone();
-            send_beacon(&send, &id, true, &[SocketAddr::new(src.ip(), DISCOVERY_PORT)]);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Messaging — UDP / TCP
-// ---------------------------------------------------------------------------
-
-fn tcp_recv_loop(listener: TcpListener, inbox: Inbox, key: KeyHolder) {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let inbox = inbox.clone();
-        let key = key.clone();
-        std::thread::spawn(move || {
-            let ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            let mut buf = Vec::new();
-            if stream.read_to_end(&mut buf).is_err() {
-                return;
-            }
-            if let Ok(env) = serde_json::from_slice::<Envelope>(&buf) {
-                push_inbox(&inbox, envelope_to_message(&key, &env, ip, "TCP"));
-            }
-        });
-    }
-}
-
-fn udp_recv_loop(socket: UdpSocket, inbox: Inbox, key: KeyHolder) {
-    let mut buf = [0u8; 65535];
-    loop {
-        let (len, src) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..len]) {
-            push_inbox(&inbox, envelope_to_message(&key, &env, src.ip().to_string(), "UDP"));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Messaging — WebSocket (LAN, persistent, bidirectional, one socket per peer)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct WsCtx {
-    identity: Arc<Mutex<Identity>>,
-    key: KeyHolder,
-    inbox: Inbox,
-    conns: WsConns,
-}
-
-fn ws_server_loop(listener: TcpListener, ctx: WsCtx) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        if let Ok(ws) = tungstenite::accept(stream) {
-            let ctx = ctx.clone();
-            std::thread::spawn(move || handle_ws_conn(ws, ctx));
-        }
-    }
-}
-
-fn handle_ws_conn<S: Read + Write>(mut ws: tungstenite::WebSocket<S>, ctx: WsCtx) {
-    {
-        let id = ctx.identity.lock().unwrap();
-        let hello = serde_json::to_string(&WsFrame::Hello {
-            node_id: id.node_id.clone(),
-            name: id.name.clone(),
-        })
-        .unwrap_or_default();
-        let _ = ws.send(tungstenite::Message::Text(hello));
-    }
-    let (tx, rx) = mpsc::channel::<String>();
-    let my_conn_id = WS_CONN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut peer_id: Option<String> = None;
-    loop {
-        match ws.read() {
-            Ok(tungstenite::Message::Text(t)) => {
-                if let Ok(frame) = serde_json::from_str::<WsFrame>(&t) {
-                    match frame {
-                        WsFrame::Hello { node_id, .. } => {
-                            let mut guard = ctx.conns.lock().unwrap();
-                            if guard.contains_key(&node_id) {
-                                break;
-                            }
-                            guard.insert(node_id.clone(), (my_conn_id, tx.clone()));
-                            drop(guard);
-                            peer_id = Some(node_id);
-                        }
-                        WsFrame::Msg { nonce, ciphertext } => {
-                            let env = Envelope { nonce, ciphertext };
-                            push_inbox(&ctx.inbox, envelope_to_message(&ctx.key, &env, String::new(), "WS"));
-                        }
-                    }
-                }
-            }
-            Ok(tungstenite::Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(e))
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        let mut dead = false;
-        while let Ok(out) = rx.try_recv() {
-            if ws.send(tungstenite::Message::Text(out)).is_err() {
-                dead = true;
-                break;
-            }
-        }
-        if dead {
-            break;
-        }
-    }
-    if let Some(pid) = peer_id {
-        let mut g = ctx.conns.lock().unwrap();
-        if g.get(&pid).map(|(id, _)| *id == my_conn_id).unwrap_or(false) {
-            g.remove(&pid);
-        }
-    }
-}
-
-fn ws_connect(ctx: WsCtx, ip: &str, ws_port: u16) -> Result<(), String> {
-    let addr: Ipv4Addr = ip.parse().map_err(|_| "bad peer ip")?;
-    let stream = TcpStream::connect_timeout(&SocketAddr::new(addr.into(), ws_port), Duration::from_secs(4))
-        .map_err(|e| format!("WS connect failed: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
-    let req = format!("ws://{ip}:{ws_port}/");
-    let (ws, _resp) = tungstenite::client(req.as_str(), stream).map_err(|e| format!("WS handshake failed: {e}"))?;
-    std::thread::spawn(move || handle_ws_conn(ws, ctx));
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Core actions (shared by JNI shims)
-// ---------------------------------------------------------------------------
-
-fn do_send(state: &NetState, node_id: &str, protocol: &str, text: &str) -> Result<(), String> {
-    let key = state.session.key.lock().unwrap().ok_or("set your encryption key first")?;
-    let from = state
-        .session
-        .username
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| state.identity.lock().unwrap().name.clone());
-    let plaintext = serde_json::to_vec(&Plaintext { from, text: text.to_string() }).map_err(|e| e.to_string())?;
-    let env = encrypt(&key, &plaintext).ok_or("encryption failed")?;
-    let body = serde_json::to_vec(&env).map_err(|e| e.to_string())?;
-    let proto = protocol.to_uppercase();
-
-    if proto == "WS" {
-        let frame = serde_json::to_string(&WsFrame::Msg {
-            nonce: env.nonce.clone(),
-            ciphertext: env.ciphertext.clone(),
-        })
-        .map_err(|e| e.to_string())?;
-        let sender = state
-            .ws_conns
+impl AndroidPlatform {
+    fn iface_v4(&self) -> Ipv4Addr {
+        self.wifi_ip
             .lock()
             .unwrap()
-            .get(node_id)
-            .map(|(_, s)| s.clone())
-            .ok_or("no WebSocket connection — connect first")?;
-        sender.send(frame).map_err(|_| "WebSocket closed".to_string())?;
-        return Ok(());
-    }
-
-    let peer = state.peers.lock().unwrap().get(node_id).cloned().ok_or("peer not found")?;
-    let ip: Ipv4Addr = peer.ip.parse().map_err(|_| "bad peer ip")?;
-    match proto.as_str() {
-        "TCP" => {
-            let mut stream = TcpStream::connect_timeout(&SocketAddr::new(ip.into(), peer.tcp_port), Duration::from_secs(3))
-                .map_err(|e| format!("TCP connect failed: {e}"))?;
-            stream.write_all(&body).map_err(|e| format!("TCP send failed: {e}"))?;
-            stream.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        "UDP" => {
-            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-            socket
-                .send_to(&body, SocketAddr::new(ip.into(), peer.udp_port))
-                .map_err(|e| format!("UDP send failed: {e}"))?;
-            Ok(())
-        }
-        other => Err(format!("unknown protocol: {other}")),
+            .parse()
+            .unwrap_or_else(|_| detect_local_ip().parse().unwrap_or(Ipv4Addr::UNSPECIFIED))
     }
 }
 
-fn build_state(device_id: String, name: String, wifi_ip: String) -> NetState {
-    // Stable, hardware-derived id (Android ANDROID_ID) so the same phone keeps
-    // one registry row across restarts; fall back to random only if absent.
-    let node_id = if device_id.trim().is_empty() {
-        uuid::Uuid::new_v4().to_string()
-    } else {
-        device_id
-    };
-    let iface: Ipv4Addr = wifi_ip
-        .parse()
-        .unwrap_or_else(|_| local_ip().parse().unwrap_or(Ipv4Addr::UNSPECIFIED));
-    let ip_display = if iface.is_unspecified() { local_ip() } else { iface.to_string() };
-
-    let tcp_listener = TcpListener::bind("0.0.0.0:0").expect("tcp");
-    let tcp_port = tcp_listener.local_addr().expect("tcp addr").port();
-    let udp_msg_socket = UdpSocket::bind("0.0.0.0:0").expect("udp");
-    let udp_port = udp_msg_socket.local_addr().expect("udp addr").port();
-    let ws_listener = TcpListener::bind("0.0.0.0:0").expect("ws");
-    let ws_port = ws_listener.local_addr().expect("ws addr").port();
-
-    let identity = Arc::new(Mutex::new(Identity {
-        node_id,
-        name,
-        ip: ip_display,
-        tcp_port,
-        udp_port,
-        ws_port,
-    }));
-    info!("identity {:?}", identity.lock().unwrap().ip);
-
-    let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-    let inbox: Inbox = Arc::new(Mutex::new(VecDeque::new()));
-    let ws_conns: WsConns = Arc::new(Mutex::new(HashMap::new()));
-    let key: KeyHolder = Arc::new(Mutex::new(None));
-
-    let (disco_send, disco_ok): (Arc<UdpSocket>, bool) = match bind_multicast(iface) {
-        Ok(recv) => {
-            let send = Arc::new(recv.try_clone().expect("clone disco"));
-            {
-                let send2 = send.clone();
-                let peers = peers.clone();
-                let identity = identity.clone();
-                std::thread::spawn(move || discovery_recv_loop(recv, send2, peers, identity));
-            }
-            (send, true)
+impl Platform for AndroidPlatform {
+    fn device_id(&self) -> String {
+        self.device_id.clone()
+    }
+    fn device_name(&self) -> String {
+        self.name.clone()
+    }
+    fn platform_kind(&self) -> &'static str {
+        "android"
+    }
+    fn iface_mode(&self) -> IfaceMode {
+        IfaceMode::Single(self.iface_v4())
+    }
+    fn local_ip(&self) -> String {
+        let i = self.iface_v4();
+        if i.is_unspecified() {
+            detect_local_ip()
+        } else {
+            i.to_string()
         }
-        Err(e) => {
-            warn!("multicast bind failed: {e}");
-            (Arc::new(UdpSocket::bind("0.0.0.0:0").expect("fallback udp")), false)
-        }
-    };
-    let _ = disco_ok;
-
-    {
-        let inbox = inbox.clone();
-        let key = key.clone();
-        std::thread::spawn(move || tcp_recv_loop(tcp_listener, inbox, key));
     }
-    {
-        let inbox = inbox.clone();
-        let key = key.clone();
-        std::thread::spawn(move || udp_recv_loop(udp_msg_socket, inbox, key));
+    fn fcm_token(&self) -> Option<String> {
+        self.fcm_token.lock().unwrap().clone()
     }
-    {
-        let ctx = WsCtx {
-            identity: identity.clone(),
-            key: key.clone(),
-            inbox: inbox.clone(),
-            conns: ws_conns.clone(),
-        };
-        std::thread::spawn(move || ws_server_loop(ws_listener, ctx));
-    }
-
-    NetState {
-        identity,
-        peers,
-        inbox,
-        disco_send,
-        ws_conns,
-        session: Session {
-            server_url: Mutex::new(None),
-            token: Mutex::new(None),
-            username: Mutex::new(None),
-            key,
-        },
-    }
+    // kv: in-memory only (None defaults). clipboard: not yet supported.
 }
 
 // ---------------------------------------------------------------------------
-// JNI surface — package com.mydomain.android, class RustNet
+// Event sink — record incoming messages into an inbox drained by poll.
+// ---------------------------------------------------------------------------
+
+struct InboxSink {
+    messages: Mutex<VecDeque<IncomingMessage>>,
+    /// Feature events (notification / call-notification / call-history) as JSON,
+    /// drained by `nativePollEvents`.
+    events: Mutex<VecDeque<serde_json::Value>>,
+}
+
+impl InboxSink {
+    fn push_event(&self, v: serde_json::Value) {
+        let mut q = self.events.lock().unwrap();
+        if q.len() >= INBOX_CAP {
+            q.pop_front();
+        }
+        q.push_back(v);
+    }
+}
+
+impl EventSink for InboxSink {
+    fn emit(&self, ev: CoreEvent) {
+        // Peers/WS-state are read directly off the Engine by the poll shims; chat
+        // goes to the message inbox; feature events go to the events inbox.
+        match ev {
+            CoreEvent::MessageReceived(m) => {
+                let mut q = self.messages.lock().unwrap();
+                if q.len() >= INBOX_CAP {
+                    q.pop_front();
+                }
+                q.push_back(m);
+            }
+            CoreEvent::Notification { from, title, body, app } => self.push_event(serde_json::json!({
+                "kind": "notification", "from": from, "title": title, "body": body, "app": app,
+            })),
+            CoreEvent::CallNotification { from, caller, number, state } => self.push_event(serde_json::json!({
+                "kind": "call_notification", "from": from, "caller": caller, "number": number, "state": state,
+            })),
+            CoreEvent::CallHistory { from, entries } => self.push_event(serde_json::json!({
+                "kind": "call_history", "from": from, "entries": entries,
+            })),
+            // Clipboard sync + peer/WS changes are not used on android today.
+            _ => {}
+        }
+    }
+}
+
+impl InboxSink {
+    fn drain(&self) -> Vec<IncomingMessage> {
+        self.messages.lock().unwrap().drain(..).collect()
+    }
+    fn drain_events(&self) -> Vec<serde_json::Value> {
+        self.events.lock().unwrap().drain(..).collect()
+    }
+}
+
+static ENGINE: OnceLock<Engine<AndroidPlatform>> = OnceLock::new();
+static SINK: OnceLock<Arc<InboxSink>> = OnceLock::new();
+static WIFI_IP: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+static FCM_TOKEN: OnceLock<Arc<Mutex<Option<String>>>> = OnceLock::new();
+
+fn engine() -> Option<&'static Engine<AndroidPlatform>> {
+    ENGINE.get()
+}
+
+/// Shared FCM-token cell, created on first use so the token can be set before or
+/// after `nativeStart`.
+fn fcm_token_cell() -> &'static Arc<Mutex<Option<String>>> {
+    FCM_TOKEN.get_or_init(|| Arc::new(Mutex::new(None)))
+}
+
+// ---------------------------------------------------------------------------
+// JNI helpers — package com.mydomain.android, class RustNet
 // ---------------------------------------------------------------------------
 
 fn jstr(env: &mut JNIEnv, s: &JString, fallback: &str) -> String {
@@ -707,6 +164,17 @@ fn ok_or_err(r: Result<(), String>) -> String {
     }
 }
 
+fn with_engine<F: FnOnce(&Engine<AndroidPlatform>) -> Result<(), String>>(f: F) -> String {
+    match engine() {
+        Some(e) => ok_or_err(f(e)),
+        None => "ERROR: not started".into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JNI surface
+// ---------------------------------------------------------------------------
+
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'l>(
     mut env: JNIEnv<'l>,
@@ -723,44 +191,56 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeStart<'l>(
     let device_id = jstr(&mut env, &device_id, "");
     let name = jstr(&mut env, &name, "android");
     let wifi_ip = jstr(&mut env, &wifi_ip, "");
-    let state = STATE.get_or_init(|| build_state(device_id, name, wifi_ip));
-    let json = serde_json::to_string(&state.identity.lock().unwrap().clone()).unwrap_or_else(|_| "{}".into());
-    ret(&mut env, json)
-}
 
-fn auth_flow(env: &mut JNIEnv, path: &str, url: JString, user: JString, pass: JString) -> String {
-    let url = jstr(env, &url, "");
-    let user = jstr(env, &user, "");
-    let pass = jstr(env, &pass, "");
-    let Some(state) = STATE.get() else { return "ERROR: not started".into() };
-    if url.trim().is_empty() {
-        return "ERROR: server URL required".into();
-    }
-    match auth_call(&url, path, user.trim(), &pass) {
-        Ok(resp) => {
-            *state.session.server_url.lock().unwrap() = Some(base(&url));
-            *state.session.token.lock().unwrap() = Some(resp.token);
-            *state.session.username.lock().unwrap() = Some(resp.username);
-            String::new()
+    if ENGINE.get().is_none() {
+        let wifi = Arc::new(Mutex::new(wifi_ip));
+        let platform = AndroidPlatform {
+            device_id,
+            name,
+            wifi_ip: wifi.clone(),
+            fcm_token: fcm_token_cell().clone(),
+        };
+        let sink = Arc::new(InboxSink {
+            messages: Mutex::new(VecDeque::new()),
+            events: Mutex::new(VecDeque::new()),
+        });
+        match Engine::start(platform, sink.clone() as Arc<dyn EventSink>) {
+            Ok(eng) => {
+                let _ = WIFI_IP.set(wifi);
+                let _ = SINK.set(sink);
+                let _ = ENGINE.set(eng);
+                info!("engine started");
+            }
+            Err(e) => return ret(&mut env, format!("ERROR: {e}")),
         }
-        Err(e) => format!("ERROR: {e}"),
     }
+
+    let json = engine()
+        .map(|e| serde_json::to_string(&e.identity()).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+    ret(&mut env, json)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeAuthLogin<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>, url: JString<'l>, user: JString<'l>, pass: JString<'l>,
 ) -> jstring {
-    let r = auth_flow(&mut env, "/auth/login", url, user, pass);
-    ret(&mut env, r)
+    let url = jstr(&mut env, &url, "");
+    let user = jstr(&mut env, &user, "");
+    let pass = jstr(&mut env, &pass, "");
+    let out = with_engine(|e| e.auth_login(&url, &user, &pass));
+    ret(&mut env, out)
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeAuthRegister<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>, url: JString<'l>, user: JString<'l>, pass: JString<'l>,
 ) -> jstring {
-    let r = auth_flow(&mut env, "/auth/register", url, user, pass);
-    ret(&mut env, r)
+    let url = jstr(&mut env, &url, "");
+    let user = jstr(&mut env, &user, "");
+    let pass = jstr(&mut env, &pass, "");
+    let out = with_engine(|e| e.auth_register(&url, &user, &pass));
+    ret(&mut env, out)
 }
 
 #[no_mangle]
@@ -768,42 +248,18 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSetEncryptionKey<
     mut env: JNIEnv<'l>, _c: JClass<'l>, passphrase: JString<'l>,
 ) -> jstring {
     let passphrase = jstr(&mut env, &passphrase, "");
-    let r = (|| {
-        let state = STATE.get().ok_or("not started")?;
-        let username = state.session.username.lock().unwrap().clone().ok_or("log in first")?;
-        if passphrase.trim().is_empty() {
-            return Err("encryption key required".to_string());
-        }
-        let key = derive_key(&passphrase, &username).ok_or("failed to derive key")?;
-        *state.session.key.lock().unwrap() = Some(key);
-        Ok(())
-    })();
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.set_encryption_key(&passphrase));
     ret(&mut env, out)
 }
 
-/// DEV / LAN-only: skip the registry login. Sets a local username + encryption
-/// key (no token, no server contact) so LAN discovery and WebSocket messaging
-/// work between devices on the same network. Both devices must use the SAME
-/// username + key to derive a matching E2EE key. Nothing is persisted.
+/// DEV / LAN-only: skip the registry login (see `Engine::dev_login`).
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeDevLogin<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>, username: JString<'l>, passphrase: JString<'l>,
 ) -> jstring {
     let username = jstr(&mut env, &username, "");
     let passphrase = jstr(&mut env, &passphrase, "");
-    let r = (|| {
-        let state = STATE.get().ok_or("not started")?;
-        let username = username.trim();
-        if username.is_empty() || passphrase.trim().is_empty() {
-            return Err("username and encryption key required".to_string());
-        }
-        let key = derive_key(&passphrase, username).ok_or("failed to derive key")?;
-        *state.session.username.lock().unwrap() = Some(username.to_string());
-        *state.session.key.lock().unwrap() = Some(key);
-        Ok(())
-    })();
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.dev_login(&username, &passphrase));
     ret(&mut env, out)
 }
 
@@ -813,21 +269,7 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeUpdateEncryptionK
 ) -> jstring {
     let new_pass = jstr(&mut env, &new_pass, "");
     let password = jstr(&mut env, &password, "");
-    let r = (|| {
-        let state = STATE.get().ok_or("not started")?;
-        let username = state.session.username.lock().unwrap().clone().ok_or("log in first")?;
-        let url = state.session.server_url.lock().unwrap().clone().ok_or("no server")?;
-        if !verify_password_call(&url, &username, &password)? {
-            return Err("incorrect password".to_string());
-        }
-        if new_pass.trim().is_empty() {
-            return Err("new key required".to_string());
-        }
-        let key = derive_key(&new_pass, &username).ok_or("failed to derive key")?;
-        *state.session.key.lock().unwrap() = Some(key);
-        Ok(())
-    })();
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.update_encryption_key(&new_pass, &password));
     ret(&mut env, out)
 }
 
@@ -835,9 +277,8 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeUpdateEncryptionK
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeLogout<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    if let Some(state) = STATE.get() {
-        *state.session.token.lock().unwrap() = None;
-        *state.session.key.lock().unwrap() = None;
+    if let Some(e) = engine() {
+        e.logout();
     }
     ret(&mut env, String::new())
 }
@@ -846,19 +287,14 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeLogout<'l>(
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeGenerateKey<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let mut bytes = [0u8; 24];
-    OsRng.fill_bytes(&mut bytes);
-    ret(&mut env, STANDARD.encode(bytes))
+    ret(&mut env, mdcore::crypto::generate_key())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeIsReady<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let ready = STATE
-        .get()
-        .map(|s| s.session.token.lock().unwrap().is_some() && s.session.key.lock().unwrap().is_some())
-        .unwrap_or(false);
+    let ready = engine().map(|e| e.is_ready()).unwrap_or(false);
     ret(&mut env, if ready { "true".into() } else { "false".into() })
 }
 
@@ -866,8 +302,7 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeIsReady<'l>(
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeRefresh<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let r = STATE.get().ok_or("not started".to_string()).and_then(do_refresh);
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.refresh_from_server());
     ret(&mut env, out)
 }
 
@@ -876,14 +311,13 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeNetworkChanged<'l
     mut env: JNIEnv<'l>, _c: JClass<'l>, wifi_ip: JString<'l>,
 ) -> jstring {
     let wifi_ip = jstr(&mut env, &wifi_ip, "");
-    if let Some(state) = STATE.get() {
-        if let Ok(v4) = wifi_ip.parse::<Ipv4Addr>() {
-            state.identity.lock().unwrap().ip = v4.to_string();
+    if let Some(w) = WIFI_IP.get() {
+        if wifi_ip.parse::<Ipv4Addr>().is_ok() {
+            *w.lock().unwrap() = wifi_ip.clone();
         }
-        let ready = state.session.token.lock().unwrap().is_some();
-        if ready {
-            let _ = do_refresh(state);
-        }
+    }
+    if let Some(e) = engine() {
+        e.network_changed(Some(&wifi_ip));
     }
     ret(&mut env, String::new())
 }
@@ -892,16 +326,8 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeNetworkChanged<'l
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeScanLan<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    if let Some(state) = STATE.get() {
-        let id = state.identity.lock().unwrap().clone();
-        let socket = state.disco_send.clone();
-        let targets = lan_targets(&id.ip);
-        std::thread::spawn(move || {
-            for _ in 0..3 {
-                send_beacon(&socket, &id, false, &targets);
-                std::thread::sleep(Duration::from_millis(700));
-            }
-        });
+    if let Some(e) = engine() {
+        e.scan_lan();
     }
     ret(&mut env, String::new())
 }
@@ -911,24 +337,7 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeConnectWs<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>, node_id: JString<'l>,
 ) -> jstring {
     let node_id = jstr(&mut env, &node_id, "");
-    let r = (|| {
-        let state = STATE.get().ok_or("not started")?;
-        let peer = state.peers.lock().unwrap().get(&node_id).cloned().ok_or("peer not found")?;
-        if peer.ws_port == 0 {
-            return Err("peer has no WebSocket port".to_string());
-        }
-        if state.ws_conns.lock().unwrap().contains_key(&node_id) {
-            return Ok(());
-        }
-        let ctx = WsCtx {
-            identity: state.identity.clone(),
-            key: state.session.key.clone(),
-            inbox: state.inbox.clone(),
-            conns: state.ws_conns.clone(),
-        };
-        ws_connect(ctx, &peer.ip, peer.ws_port)
-    })();
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.connect_ws(&node_id));
     ret(&mut env, out)
 }
 
@@ -939,11 +348,7 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSend<'l>(
     let node_id = jstr(&mut env, &node_id, "");
     let protocol = jstr(&mut env, &protocol, "UDP");
     let text = jstr(&mut env, &text, "");
-    let r = STATE
-        .get()
-        .ok_or("not started".to_string())
-        .and_then(|s| do_send(s, &node_id, &protocol, &text));
-    let out = ok_or_err(r);
+    let out = with_engine(|e| e.send(&node_id, &protocol, &text));
     ret(&mut env, out)
 }
 
@@ -951,12 +356,8 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSend<'l>(
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeGetPeers<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let json = STATE
-        .get()
-        .map(|s| {
-            let list: Vec<Peer> = s.peers.lock().unwrap().values().cloned().collect();
-            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
-        })
+    let json = engine()
+        .map(|e| serde_json::to_string(&e.get_peers()).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|| "[]".into());
     ret(&mut env, json)
 }
@@ -965,28 +366,127 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeGetPeers<'l>(
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativePollMessages<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let json = STATE
+    let json = SINK
         .get()
-        .map(|s| {
-            let drained: Vec<IncomingMessage> = s.inbox.lock().unwrap().drain(..).collect();
-            serde_json::to_string(&drained).unwrap_or_else(|_| "[]".into())
-        })
+        .map(|s| serde_json::to_string(&s.drain()).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|| "[]".into());
     ret(&mut env, json)
 }
 
-/// node_ids of peers with a live WebSocket. Reads the actual conn map, so this
-/// is true on the accepting side too — not just the side that dialed.
+/// node_ids of peers with a live WebSocket (true on the accepting side too).
 #[no_mangle]
 pub extern "system" fn Java_com_mydomain_android_RustNet_nativeConnectedPeers<'l>(
     mut env: JNIEnv<'l>, _c: JClass<'l>,
 ) -> jstring {
-    let json = STATE
-        .get()
-        .map(|s| {
-            let ids: Vec<String> = s.ws_conns.lock().unwrap().keys().cloned().collect();
-            serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
-        })
+    let json = engine()
+        .map(|e| serde_json::to_string(&e.connected_peers()).unwrap_or_else(|_| "[]".into()))
         .unwrap_or_else(|| "[]".into());
     ret(&mut env, json)
+}
+
+/// Drain feature events (notification / call-notification / call-history) as a
+/// JSON array; each object has a `kind` discriminator.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativePollEvents<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>,
+) -> jstring {
+    let json = SINK
+        .get()
+        .map(|s| serde_json::to_string(&s.drain_events()).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
+    ret(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeShareNotification<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, title: JString<'l>, body: JString<'l>, app: JString<'l>,
+) -> jstring {
+    let title = jstr(&mut env, &title, "");
+    let body = jstr(&mut env, &body, "");
+    let app = jstr(&mut env, &app, "");
+    if let Some(e) = engine() {
+        let app = if app.is_empty() { None } else { Some(app.as_str()) };
+        e.share_notification(&title, &body, app);
+    }
+    ret(&mut env, String::new())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeShareCallNotification<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, caller: JString<'l>, number: JString<'l>, state: JString<'l>,
+) -> jstring {
+    let caller = jstr(&mut env, &caller, "");
+    let number = jstr(&mut env, &number, "");
+    let state = jstr(&mut env, &state, "");
+    if let Some(e) = engine() {
+        let number = if number.is_empty() { None } else { Some(number.as_str()) };
+        e.share_call_notification(&caller, number, &state);
+    }
+    ret(&mut env, String::new())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeShareCallHistory<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, entries_json: JString<'l>,
+) -> jstring {
+    let entries_json = jstr(&mut env, &entries_json, "[]");
+    if let Some(e) = engine() {
+        e.share_call_history(&entries_json);
+    }
+    ret(&mut env, String::new())
+}
+
+// --- signaling / connection setup ---
+
+/// Set the Firebase FCM token (from Kotlin). Re-registers so the server stores
+/// it. Order-independent vs `nativeStart`.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSetFcmToken<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, token: JString<'l>,
+) -> jstring {
+    let token = jstr(&mut env, &token, "");
+    *fcm_token_cell().lock().unwrap() = if token.is_empty() { None } else { Some(token) };
+    if let Some(e) = engine() {
+        let _ = e.refresh_from_server();
+    }
+    ret(&mut env, String::new())
+}
+
+/// Feed an inbound FCM signal (from Kotlin's FirebaseMessagingService).
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeOnSignal<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, from: JString<'l>, payload: JString<'l>,
+) -> jstring {
+    let from = jstr(&mut env, &from, "");
+    let payload = jstr(&mut env, &payload, "");
+    if let Some(e) = engine() {
+        e.on_signal(&from, &payload);
+    }
+    ret(&mut env, String::new())
+}
+
+/// Connect to a peer along the fallback ladder.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeConnect<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, node_id: JString<'l>,
+) -> jstring {
+    let node_id = jstr(&mut env, &node_id, "");
+    let out = with_engine(|e| e.connect(&node_id));
+    ret(&mut env, out)
+}
+
+/// Run the startup firewall check; returns JSON `{outbound_ok, inbound_blocked}`
+/// or `ERROR: ...`.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeFirewallCheck<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>,
+) -> jstring {
+    let out = match engine() {
+        Some(e) => match e.firewall_check() {
+            Ok(fs) => serde_json::json!({ "outbound_ok": fs.outbound_ok, "inbound_blocked": fs.inbound_blocked }).to_string(),
+            Err(e) => format!("ERROR: {e}"),
+        },
+        None => "ERROR: not started".into(),
+    };
+    ret(&mut env, out)
 }

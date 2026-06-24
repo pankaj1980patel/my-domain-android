@@ -574,6 +574,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
+name = "mdcore"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64",
+ "chacha20poly1305",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tungstenite",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,17 +600,12 @@ name = "mydomain_net"
 version = "0.1.0"
 dependencies = [
  "android_logger",
- "argon2",
- "base64",
- "chacha20poly1305",
  "jni",
  "log",
- "rand_core",
- "serde",
+ "mdcore",
  "serde_json",
  "socket2",
  "tungstenite",
- "ureq",
  "uuid",
 ]
 
