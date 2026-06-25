@@ -115,6 +115,9 @@ impl EventSink for InboxSink {
             CoreEvent::CallHistory { from, entries } => self.push_event(serde_json::json!({
                 "kind": "call_history", "from": from, "entries": entries,
             })),
+            CoreEvent::AppsList { from, apps, subscribed } => self.push_event(serde_json::json!({
+                "kind": "apps_list", "from": from, "apps": apps, "subscribed": subscribed,
+            })),
             // Clipboard sync + peer/WS changes are not used on android today.
             _ => {}
         }
@@ -489,4 +492,54 @@ pub extern "system" fn Java_com_mydomain_android_RustNet_nativeFirewallCheck<'l>
         None => "ERROR: not started".into(),
     };
     ret(&mut env, out)
+}
+
+// --- app-notification pub/sub ---
+
+/// Producer: publish this device's shareable app list (JSON array of {pkg,label}).
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSetInstalledApps<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, apps_json: JString<'l>,
+) -> jstring {
+    let apps_json = jstr(&mut env, &apps_json, "[]");
+    if let Some(e) = engine() {
+        e.set_installed_apps(&apps_json);
+    }
+    ret(&mut env, String::new())
+}
+
+/// Consumer: request a producer's app list (reply arrives via nativePollEvents).
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeRequestApps<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, node_id: JString<'l>,
+) -> jstring {
+    let node_id = jstr(&mut env, &node_id, "");
+    let out = with_engine(|e| e.request_apps(&node_id));
+    ret(&mut env, out)
+}
+
+/// Consumer: set the enabled package set (JSON array of pkg strings) on a producer.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeSubscribeApps<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, node_id: JString<'l>, apps_json: JString<'l>,
+) -> jstring {
+    let node_id = jstr(&mut env, &node_id, "");
+    let apps_json = jstr(&mut env, &apps_json, "[]");
+    let out = with_engine(|e| e.subscribe_apps(&node_id, &apps_json));
+    ret(&mut env, out)
+}
+
+/// Producer: a captured app notification — forwarded to subscribers of `pkg`.
+#[no_mangle]
+pub extern "system" fn Java_com_mydomain_android_RustNet_nativeShareAppNotification<'l>(
+    mut env: JNIEnv<'l>, _c: JClass<'l>, pkg: JString<'l>, app: JString<'l>, title: JString<'l>, body: JString<'l>,
+) -> jstring {
+    let pkg = jstr(&mut env, &pkg, "");
+    let app = jstr(&mut env, &app, "");
+    let title = jstr(&mut env, &title, "");
+    let body = jstr(&mut env, &body, "");
+    if let Some(e) = engine() {
+        e.share_app_notification(&pkg, &app, &title, &body);
+    }
+    ret(&mut env, String::new())
 }

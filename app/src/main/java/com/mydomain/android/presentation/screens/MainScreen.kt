@@ -34,6 +34,7 @@ import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -82,6 +83,9 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
     var status by remember { mutableStateOf("") }
     var notifTitle by remember { mutableStateOf("") }
     var notifBody by remember { mutableStateOf("") }
+    var appsList by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) } // pkg to label
+    var appsSubscribed by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var appsSearch by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
     var clipSync by remember { mutableStateOf(NetService.clipboardSyncEnabled) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -91,6 +95,30 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == "com.mydomain.android.NEW_EVENT") {
+                    val ev = intent.getStringExtra("event") ?: return
+                    runCatching {
+                        val o = JSONObject(ev)
+                        val from = o.optString("from")
+                        when (o.optString("kind")) {
+                            "notification" -> {
+                                val body = o.optString("body")
+                                log.add(0, LogEntry("in", from, "", "NOTIF", "🔔 ${o.optString("title")}" + if (body.isNotEmpty()) " — $body" else "", true))
+                            }
+                            "call_notification" -> log.add(0, LogEntry("in", from, "", "CALL", "📞 ${o.optString("caller")} (${o.optString("state")})", true))
+                            "call_history" -> log.add(0, LogEntry("in", from, "", "CALL", "📞 Call history synced", true))
+                            "apps_list" -> if (from == selected) {
+                                val appsArr = o.optJSONArray("apps") ?: JSONArray()
+                                appsList = (0 until appsArr.length()).map {
+                                    val a = appsArr.getJSONObject(it); a.optString("pkg") to a.optString("label")
+                                }
+                                val subArr = o.optJSONArray("subscribed") ?: JSONArray()
+                                appsSubscribed = (0 until subArr.length()).map { subArr.getString(it) }.toSet()
+                            }
+                        }
+                    }
+                    return
+                }
                 val msgJson = intent?.getStringExtra("msg") ?: return
                 runCatching {
                     val o = JSONObject(msgJson)
@@ -111,7 +139,10 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                 }
             }
         }
-        val filter = IntentFilter("com.mydomain.android.NEW_MESSAGE")
+        val filter = IntentFilter().apply {
+            addAction("com.mydomain.android.NEW_MESSAGE")
+            addAction("com.mydomain.android.NEW_EVENT")
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -289,6 +320,31 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                                     }
                                 }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Send to my devices") }
                             }
+                        }
+                    }
+
+                    // App notifications (pub/sub): pick which of this device's apps mirror here.
+                    item {
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp)) {
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Text("📥  App notifications", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                                    TextButton(onClick = { scope.launch { withContext(Dispatchers.IO) { RustNet.nativeRequestApps(sel.nodeId) } } }) { Text("Refresh") }
+                                }
+                                OutlinedTextField(appsSearch, { appsSearch = it }, label = { Text("Search apps") }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+                            }
+                        }
+                    }
+                    items(appsList.filter { appsSearch.isBlank() || it.second.contains(appsSearch, true) || it.first.contains(appsSearch, true) }) { (pkg, label) ->
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(label.ifBlank { pkg }, fontSize = 14.sp)
+                                Text(pkg, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
+                            }
+                            Switch(checked = appsSubscribed.contains(pkg), onCheckedChange = { on ->
+                                val ns = appsSubscribed.toMutableSet(); if (on) ns.add(pkg) else ns.remove(pkg); appsSubscribed = ns
+                                scope.launch { withContext(Dispatchers.IO) { RustNet.nativeSubscribeApps(sel.nodeId, JSONArray(ns.toList()).toString()) } }
+                            })
                         }
                     }
 

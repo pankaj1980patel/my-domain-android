@@ -51,4 +51,14 @@ object RustNet {
     external fun nativeConnect(nodeId: String): String
     /** JSON {outbound_ok, inbound_blocked} or "ERROR: ...". */
     external fun nativeFirewallCheck(): String
+
+    // ---- app-notification pub/sub ----
+    /** Publish this device's shareable app list (JSON array of {pkg,label}). */
+    external fun nativeSetInstalledApps(appsJson: String): String
+    /** Consumer: request a producer's app list (reply via nativePollEvents). */
+    external fun nativeRequestApps(nodeId: String): String
+    /** Consumer: set enabled packages (JSON array of pkg strings) on a producer. */
+    external fun nativeSubscribeApps(nodeId: String, appsJson: String): String
+    /** Producer: forward a captured app notification to subscribers of pkg. */
+    external fun nativeShareAppNotification(pkg: String, app: String, title: String, body: String): String
 }

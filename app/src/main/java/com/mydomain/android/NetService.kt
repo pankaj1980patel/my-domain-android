@@ -70,6 +70,7 @@ class NetService : Service() {
         val identityJson = RustNet.nativeStart(resolveDeviceId(), Build.MODEL ?: "android", ip)
         runCatching { myNodeId = JSONObject(identityJson).optString("node_id", "") }
 
+        publishInstalledApps()
         startNetworking()
     }
 
@@ -100,8 +101,13 @@ class NetService : Service() {
                 "net_service", "Networking Service",
                 NotificationManager.IMPORTANCE_LOW
             )
+            val shared = NotificationChannel(
+                "shared_notif", "Shared notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            )
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
+            manager?.createNotificationChannel(shared)
         }
     }
 
@@ -118,6 +124,40 @@ class NetService : Service() {
             .build()
     }
 
+    /** Publish launchable apps (pkg + label) so peers can pick which to subscribe to. */
+    private fun publishInstalledApps() {
+        serviceScope.launch {
+            val json = runCatching {
+                val pm = packageManager
+                val launchable = pm.getInstalledApplications(0)
+                    .filter { pm.getLaunchIntentForPackage(it.packageName) != null }
+                    .map { it.packageName to pm.getApplicationLabel(it).toString() }
+                    .sortedBy { it.second.lowercase() }
+                val arr = JSONArray()
+                for ((pkg, label) in launchable) {
+                    arr.put(JSONObject().put("pkg", pkg).put("label", label))
+                }
+                arr.toString()
+            }.getOrDefault("[]")
+            RustNet.nativeSetInstalledApps(json)
+        }
+    }
+
+    private val sharedNotifId = java.util.concurrent.atomic.AtomicInteger(1000)
+
+    /** Post a peer-shared notification/call as a local OS notification. Requires
+     *  POST_NOTIFICATIONS on API 33+; silently no-ops if not granted. */
+    private fun postSharedNotification(title: String, text: String) {
+        if (title.isBlank() && text.isBlank()) return
+        val n = NotificationCompat.Builder(this, "shared_notif")
+            .setContentTitle(title.ifBlank { "Notification" })
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setAutoCancel(true)
+            .build()
+        runCatching { getSystemService(NotificationManager::class.java)?.notify(sharedNotifId.incrementAndGet(), n) }
+    }
+
     private fun startNetworking() {
         serviceScope.launch {
             while (isActive) {
@@ -128,7 +168,7 @@ class NetService : Service() {
                         for (i in 0 until arr.length()) {
                             val o = arr.getJSONObject(i)
                             handleIncomingMessage(o)
-                            
+
                             // Broadcast for UI
                             val intent = Intent("com.mydomain.android.NEW_MESSAGE")
                             intent.putExtra("msg", o.toString())
@@ -137,6 +177,23 @@ class NetService : Service() {
                     }
                 } catch (e: Exception) {
                     Log.e("NetService", "Error polling messages", e)
+                }
+                // Feature events (notification / call-notification / call-history).
+                try {
+                    val events = RustNet.nativePollEvents()
+                    if (events != "[]") {
+                        val arr = JSONArray(events)
+                        for (i in 0 until arr.length()) {
+                            val o = arr.getJSONObject(i)
+                            sendBroadcast(Intent("com.mydomain.android.NEW_EVENT").apply { putExtra("event", o.toString()) })
+                            when (o.optString("kind")) {
+                                "notification" -> postSharedNotification(o.optString("title"), o.optString("body"))
+                                "call_notification" -> postSharedNotification("Call · ${o.optString("caller")}", o.optString("state"))
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("NetService", "Error polling events", e)
                 }
                 delay(1000)
             }
