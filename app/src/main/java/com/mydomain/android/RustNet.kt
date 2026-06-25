@@ -37,4 +37,18 @@ object RustNet {
 
     /** JSON array of node_ids with a live WebSocket (true on both ends). */
     external fun nativeConnectedPeers(): String
+
+    // ---- feature sharing ----
+    external fun nativeShareNotification(title: String, body: String, app: String): String
+    external fun nativeShareCallNotification(caller: String, number: String, state: String): String
+    external fun nativeShareCallHistory(entriesJson: String): String
+    /** Drain feature events (notification / call-*) as a JSON array. */
+    external fun nativePollEvents(): String
+
+    // ---- signaling / connection setup ----
+    external fun nativeSetFcmToken(token: String): String
+    external fun nativeOnSignal(from: String, payload: String): String
+    external fun nativeConnect(nodeId: String): String
+    /** JSON {outbound_ok, inbound_blocked} or "ERROR: ...". */
+    external fun nativeFirewallCheck(): String
 }
