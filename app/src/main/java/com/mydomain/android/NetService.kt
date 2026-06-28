@@ -281,21 +281,12 @@ class NetService : Service() {
         }
     }
 
-    /** Send a clipboard control message to one peer (WS if connected, else UDP). */
+    /** Send a clipboard control message to one peer over the active connection
+     *  (the engine auto-selects: live link if any, else directed UDP/TCP). */
     private fun sendClip(nodeId: String, json: String) {
         serviceScope.launch {
-            val proto = if (connectedPeerSet().contains(nodeId)) "WS" else "UDP"
-            RustNet.nativeSend(nodeId, proto, json)
+            RustNet.nativeSend(nodeId, json)
         }
-    }
-
-    private fun connectedPeerSet(): Set<String> {
-        val set = mutableSetOf<String>()
-        runCatching {
-            val arr = JSONArray(RustNet.nativeConnectedPeers())
-            for (i in 0 until arr.length()) set.add(arr.getString(i))
-        }
-        return set
     }
 
     private fun updateLocalClipboard(content: String) {
@@ -323,16 +314,10 @@ class NetService : Service() {
             
             val peersJson = RustNet.nativeGetPeers()
             val peers = JSONArray(peersJson)
-            val connectedJson = RustNet.nativeConnectedPeers()
-            val connectedIds = JSONArray(connectedJson)
-            val connectedSet = mutableSetOf<String>()
-            for (i in 0 until connectedIds.length()) connectedSet.add(connectedIds.getString(i))
-
             for (i in 0 until peers.length()) {
                 val p = peers.getJSONObject(i)
                 val nodeId = p.getString("node_id")
-                val proto = if (connectedSet.contains(nodeId)) "WS" else "UDP"
-                RustNet.nativeSend(nodeId, proto, json)
+                RustNet.nativeSend(nodeId, json)
             }
         }
     }

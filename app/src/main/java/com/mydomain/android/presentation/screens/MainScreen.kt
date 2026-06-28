@@ -78,7 +78,8 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
     var connected by remember { mutableStateOf<Set<String>>(emptySet()) }
     val log = remember { mutableStateListOf<LogEntry>() }
     var selected by remember { mutableStateOf<String?>(null) }
-    var protocol by remember { mutableStateOf("WS") }
+    // Directed transport used only when there's no live connection (default UDP).
+    var directedTransport by remember { mutableStateOf(RustNet.nativeDirectedTransport().ifEmpty { "UDP" }) }
     var message by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var notifTitle by remember { mutableStateOf("") }
@@ -254,9 +255,18 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                         Card(Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp)) {
                                 Text("✉  Send message", fontWeight = FontWeight.SemiBold)
-                                Row(Modifier.padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf("UDP", "TCP", "WS").forEach { pr ->
-                                        FilterChip(selected = protocol == pr, onClick = { protocol = pr }, label = { Text(pr) })
+                                Text(
+                                    if (connected.contains(sel.nodeId)) "Sends over the active connection."
+                                    else "No live connection — sends directly over $directedTransport.",
+                                    fontSize = 12.sp, modifier = Modifier.padding(vertical = 6.dp)
+                                )
+                                // Directed transport (used only when not connected).
+                                Row(Modifier.padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf("UDP", "TCP").forEach { pr ->
+                                        FilterChip(selected = directedTransport == pr, onClick = {
+                                            directedTransport = pr
+                                            scope.launch(Dispatchers.IO) { RustNet.nativeSetDirectedTransport(pr) }
+                                        }, label = { Text(pr) })
                                     }
                                 }
                                 OutlinedTextField(message, { message = it }, label = { Text("Message") }, modifier = Modifier.fillMaxWidth())
@@ -265,11 +275,8 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                                     val text = message.trim()
                                     if (text.isEmpty()) { status = "Message is empty"; return@Button }
                                     scope.launch {
-                                        val e = withContext(Dispatchers.IO) {
-                                            if (protocol == "WS") { RustNet.nativeConnectWs(node); delay(400) }
-                                            RustNet.nativeSend(node, protocol, text)
-                                        }
-                                        if (e.isEmpty()) { log.add(0, LogEntry("out", sel.name, sel.ip, protocol, text, true)); message = ""; status = "Sent over $protocol" }
+                                        val e = withContext(Dispatchers.IO) { RustNet.nativeSend(node, text) }
+                                        if (!e.startsWith("ERROR")) { log.add(0, LogEntry("out", sel.name, sel.ip, e, text, true)); message = ""; status = "Sent over $e" }
                                         else status = e.removePrefix("ERROR: ")
                                     }
                                 }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Send") }
@@ -294,11 +301,8 @@ fun MainScreen(prefs: SharedPreferences, onLogout: () -> Unit) {
                                     val node = sel.nodeId
                                     val req = JSONObject().apply { put("type", "clipboard_request"); put("from", NetService.myNodeId) }.toString()
                                     scope.launch {
-                                        val e = withContext(Dispatchers.IO) {
-                                            val proto = if (connected.contains(node)) "WS" else "UDP"
-                                            RustNet.nativeSend(node, proto, req)
-                                        }
-                                        status = if (e.isEmpty()) "Requested clipboard…" else e.removePrefix("ERROR: ")
+                                        val e = withContext(Dispatchers.IO) { RustNet.nativeSend(node, req) }
+                                        status = if (!e.startsWith("ERROR")) "Requested clipboard…" else e.removePrefix("ERROR: ")
                                     }
                                 }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Get clipboard (once)") }
                             }

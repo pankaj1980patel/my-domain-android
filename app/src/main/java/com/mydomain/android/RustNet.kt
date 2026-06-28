@@ -29,8 +29,13 @@ object RustNet {
     external fun nativeScanLan(): String
     external fun nativeConnectWs(nodeId: String): String
 
-    /** protocol is "UDP", "TCP", or "WS". */
-    external fun nativeSend(nodeId: String, protocol: String, text: String): String
+    /** Auto-selects the transport (active connection if any, else directed
+     *  UDP/TCP). Returns the protocol used on success, or "ERROR: …". */
+    external fun nativeSend(nodeId: String, text: String): String
+
+    /** Directed transport ("UDP" | "TCP") used when no live connection exists. */
+    external fun nativeDirectedTransport(): String
+    external fun nativeSetDirectedTransport(transport: String): String
 
     external fun nativeGetPeers(): String
     external fun nativePollMessages(): String
